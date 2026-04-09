@@ -32,6 +32,13 @@ venv/
 xcodeeval/
 humanevalpack/
 
+# LLM / controller scripts (do not commit)
+LLM_api.py
+LLMClient_api.py
+api_manager.py
+ip_controller.py
+rotator.py
+
 # Nested repos / build dirs inside vendor folders
 humanevalpack/rust/my_new_project/
 testbox/rust/
