@@ -1,0 +1,37 @@
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build artifacts / binaries
+*.exe
+*.out
+*.pdb
+*.class
+*.o
+*.so
+*.dll
+*.dylib
+*.jar
+
+# Local sync / temp
+.stfolder/
+
+# Datasets (do not commit)
+xcodeeval/
+humanevalpack/
+
+# Nested repos / build dirs inside vendor folders
+humanevalpack/rust/my_new_project/
+testbox/rust/

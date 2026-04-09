@@ -1,0 +1,12 @@
+You are an expert software engineer.
+
+The following program is buggy. It should pass all provided tests.
+
+Instructions:
+1. Understand the intended functionality from the tests.
+2. Identify the bug in the implementation.
+3. Fix the bug while keeping the original structure when possible.
+4. Do not change the function signature.
+5. Output ONLY the corrected code.
+
+
