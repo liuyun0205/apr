@@ -41,4 +41,4 @@ rotator.py
 
 # Nested repos / build dirs inside vendor folders
 humanevalpack/rust/my_new_project/
-testbox/rust/
+testbox/rust/target/
