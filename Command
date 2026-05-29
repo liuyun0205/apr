@@ -1,0 +1,57 @@
+# sub_test 全量 + 本地模型
+MODEL=~/model/Qwen2___5-Coder-3B-Instruct
+
+cd /home/liuzhihao/apr
+
+for f in datasets/xcodeeval/sub_test/*.jsonl; do
+  echo "=== EVAL $f ==="
+  python datasets/xcodeeval/eval.py \
+    --data "$f" \
+    --model-type local \
+    --model "$MODEL" \
+    --paradigm direct \
+    --llm-timeout 600 \
+    --resume
+done
+
+# 结果目录: results/local_Qwen2___5-Coder-3B-Instruct/<语言>/*.txt
+
+# ---------- API gpt-5-mini ----------
+#
+# 轮换 key/IP（默认）:
+# for f in datasets/xcodeeval/sub_test/*.jsonl; do
+#   echo "=== EVAL $f ==="
+#   python datasets/xcodeeval/eval.py \
+#     --data "$f" --model gpt-5-mini \
+#     --result-dir results/direct_GPT_5-mini --resume
+# done
+for f in datasets/xcodeeval/sub_test/*.jsonl; do
+  echo "=== EVAL $f ==="
+  python datasets/xcodeeval/eval.py \
+    --data "$f" --model gpt-5-mini \
+    --result-dir results/direct_GPT_5-mini --resume
+done
+# 直连 chshapi（--no-rotate）:
+# export OPENAI_API_KEY='sk-...'
+# for f in datasets/xcodeeval/sub_test/*.jsonl; do
+#   echo "=== EVAL $f ==="
+#   python datasets/xcodeeval/eval.py \
+#     --data "$f" --model gpt-5-mini --no-rotate \
+#     --base-url https://api.chshapi.org \
+#     --result-dir results/direct_GPT_5-mini --resume
+# done
+#
+# ---------- 评测已有代码（各语言通过率）----------
+  python datasets/xcodeeval/eval.py \
+  --score-dir results/GPT_5_mini \
+  --data-root datasets/xcodeeval/sub_test \
+
+
+# 新跑评测（默认已是 index 文件名）
+python datasets/xcodeeval/eval.py --data datasets/xcodeeval/sub_test/Python.jsonl ...
+
+# 评测已有结果（score 模式同样认 index 文件名）
+python datasets/xcodeeval/eval.py --score-dir results/direct_GPT_5-mini --data-root datasets/xcodeeval/sub_test
+
+# 查第 5 题对应的真实 bug_code_uid
+python datasets/xcodeeval/sub_test_map.py lookup --lang Python --index 5 --id-field bug_code_uid

@@ -4,12 +4,26 @@ from collections import Counter
 from model import model
 from config import get_args
 from utils import write2file,run_program,get_filename
+
+try:
+    from datasets.xcodeeval.sub_test_map import SubTestIndexMap, get_map
+except ImportError:
+    SubTestIndexMap = None  # type: ignore
+    get_map = None  # type: ignore
+
+
 class dataset():
-    def __init__(self,root):
+    def __init__(self, root, *, index_map: bool = True):
         self.root = root
-        self.data={}
-        self.id_map={}
-        self.details_map={}
+        self.data = {}
+        self.id_map = {}
+        self.details_map = {}
+        self._index_map = None
+        if index_map and get_map is not None:
+            try:
+                self._index_map = get_map()
+            except FileNotFoundError:
+                pass
     def load(self, language):
         filepath = os.path.join(self.root, f"{language}.jsonl")
         problem_descriptions=os.path.join("xcodeeval", f"problem_descriptions.jsonl")
@@ -26,6 +40,16 @@ class dataset():
                 self.data[language].append(item)
                 uid = item["bug_code_uid"]
                 self.id_map[uid] = item
+
+    def uid_from_index(self, language, line_id, field="bug_code_uid"):
+        """通过 0 起始 index 获取真实 id（需已生成 sub_test_index.json）。"""
+        if self._index_map is not None:
+            return self._index_map.get_id(language, line_id, id_field=field)
+        if language not in self.data:
+            self.load(language)
+        if line_id < 0 or line_id >= len(self.data[language]):
+            raise IndexError(f"{language} index {line_id} out of range")
+        return self.data[language][line_id].get(field)
 
     def read(self, language, line_id, field=None):
         if language not in self.data:
@@ -70,7 +94,7 @@ Buggy program:
 """
                     revise=model.main(question)
                     write2file(get_filename(language),revise)
-                    uid = self.read(language,line_id,"src_uid")
+                    uid = self.uid_from_index(language, line_id, field="src_uid")
                     cases = testcases.get(uid, [])
                     all_pass=True
                     for case in cases:

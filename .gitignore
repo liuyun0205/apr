@@ -28,8 +28,20 @@ venv/
 # Local sync / temp
 .stfolder/
 
-# Datasets (do not commit)
-xcodeeval/
+# Evaluation outputs (do not commit)
+results/
+result/
+eval_outputs/
+**/eval_report.json
+
+# Datasets / large data (do not commit; keep datasets/**/*.py)
+datasets/**
+!datasets/**/
+!datasets/**/*.py
+data.txt
+
+# Legacy dataset paths (root-level vendor trees)
+/xcodeeval/
 humanevalpack/
 
 # LLM / controller scripts (do not commit)
