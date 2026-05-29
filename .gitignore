@@ -50,6 +50,8 @@ LLMClient_api.py
 api_manager.py
 ip_controller.py
 rotator.py
+freeapi/
+ipipgo.py
 
 # Nested repos / build dirs inside vendor folders
 humanevalpack/rust/my_new_project/

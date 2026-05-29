@@ -3,7 +3,7 @@ MODEL=~/model/Qwen2___5-Coder-3B-Instruct
 
 cd /home/liuzhihao/apr
 
-for f in datasets/xcodeeval/sub_test/*.jsonl; do
+for f in datasets/xcodeeval/sub_test/LLVMIR.jsonl; do
   echo "=== EVAL $f ==="
   python datasets/xcodeeval/eval.py \
     --data "$f" \
@@ -16,27 +16,12 @@ done
 
 # 结果目录: results/local_Qwen2___5-Coder-3B-Instruct/<语言>/*.txt
 
-# ---------- API gpt-5-mini ----------
-#
-# 轮换 key/IP（默认）:
-# for f in datasets/xcodeeval/sub_test/*.jsonl; do
-#   echo "=== EVAL $f ==="
-#   python datasets/xcodeeval/eval.py \
-#     --data "$f" --model gpt-5-mini \
-#     --result-dir results/direct_GPT_5-mini --resume
-# done
-for f in datasets/xcodeeval/sub_test/*.jsonl; do
-  echo "=== EVAL $f ==="
-  python datasets/xcodeeval/eval.py \
-    --data "$f" --model gpt-5-mini \
-    --result-dir results/direct_GPT_5-mini --resume
-done
-# 直连 chshapi（--no-rotate）:
+# ---------- API gpt-5-mini（直连 chshapi）----------
 # export OPENAI_API_KEY='sk-...'
 # for f in datasets/xcodeeval/sub_test/*.jsonl; do
 #   echo "=== EVAL $f ==="
 #   python datasets/xcodeeval/eval.py \
-#     --data "$f" --model gpt-5-mini --no-rotate \
+#     --data "$f" --model-type api --model gpt-5-mini \
 #     --base-url https://api.chshapi.org \
 #     --result-dir results/direct_GPT_5-mini --resume
 # done

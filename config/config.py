@@ -5,9 +5,6 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--basemodel", type=str, default="None")
     parser.add_argument("--model_type", type=str, default="own", choices=["own", "local", "api"])
-    rot = parser.add_mutually_exclusive_group()
-    rot.add_argument("--rotate", dest="rotate", action="store_true", default=None)
-    rot.add_argument("--no-rotate", dest="rotate", action="store_false")
     parser.add_argument(
         "--base_url",
         type=str,

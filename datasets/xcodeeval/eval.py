@@ -16,7 +16,6 @@ if _REPO_ROOT not in sys.path:
 
 from LLM import DEFAULT_API_BASE_URL, LLM, LLMConfig, resolve_api_base_url  # noqa: E402
 from runner import run as run_testcases  # noqa: E402
-from freeapi.free_llm import FreeLLM, FreeLLMConfig  # noqa: E402
 from utils import file2text  # noqa: E402
 
 try:
@@ -132,20 +131,6 @@ def parseArgs() -> argparse.Namespace:
         choices=["api", "local"],
         help="api=远程 API；local=本地 Transformers",
     )
-    rot = p.add_mutually_exclusive_group()
-    rot.add_argument(
-        "--rotate",
-        dest="rotate",
-        action="store_true",
-        default=None,
-        help="api 模式：freeapi 轮换 key/IP（默认）",
-    )
-    rot.add_argument(
-        "--no-rotate",
-        dest="rotate",
-        action="store_false",
-        help="api 模式：固定 key 直连 chshapi，不轮换",
-    )
     p.add_argument("--model", type=str, default="", help="模型名（生成模式必填）")
     p.add_argument(
         "--base-url",
@@ -224,18 +209,11 @@ def _safePathComponent(name: str) -> str:
 
 
 def normalizeModelArgs(args: argparse.Namespace) -> None:
-    """兼容旧 --model-type direct，并解析 api 是否轮换。"""
+    """兼容旧 --model-type direct。"""
     mt = (args.model_type or "").strip().lower()
     if mt == "direct":
-        print("提示: --model-type direct 已弃用，请改用 --model-type api --no-rotate", file=sys.stderr)
+        print("提示: --model-type direct 已弃用，请改用 --model-type api", file=sys.stderr)
         args.model_type = "api"
-        if args.rotate is not False:
-            args.rotate = False
-    if args.model_type == "api":
-        if args.rotate is None:
-            args.rotate = True
-    else:
-        args.rotate = False
 
 
 def loadUnittestDb(path: str) -> Dict[str, Any]:
@@ -833,10 +811,6 @@ def buildLlmChat(args: argparse.Namespace, system_prompt: str):
         )
         return llm.chat, "local"
 
-    if args.rotate:
-        llm = FreeLLM(FreeLLMConfig(model=args.model, system_prompt=system_prompt))
-        return llm.chat, "api+rotate"
-
     base_url = resolve_api_base_url(cli_base_url=args.base_url or "")
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("CHSHAPI_API_KEY")
     if not api_key:
@@ -913,7 +887,7 @@ def main() -> int:
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 2
-    print(f"LLM 后端: {backend}" + (" (freeapi 轮换)" if args.rotate else ""))
+    print(f"LLM 后端: {backend}")
 
     result_dir = resolveResultDir(args)
     args.result_dir = result_dir
@@ -1019,7 +993,7 @@ def main() -> int:
         attempt = 0
         while True:
             try:
-                # 使用 freeapi 策略封装（api）或基础 LLM（local）
+                # api=直连 LLM；local=本地 Transformers
                 fixed = callLlmWithTimeout(llm_chat, prompt, timeout_s=args.llm_timeout, heartbeat_s=args.heartbeat)
                 # LLM 成功后先刷新一次进度（仍在本条内）
                 if pbar is None:
