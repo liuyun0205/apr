@@ -62,3 +62,32 @@ llm = LLM(LLMConfig(
     base_url="http://127.0.0.1:8000/v1/chat/completions",
     system_prompt="...",
 ))
+
+
+
+cd /home/lzh/apr
+# 设置 CUDA_VISIBLE_DEVICES 后，进程内只有 cuda:0,1,2（对应物理卡 4,5,6）
+# CodeContestPlus:
+# CUDA_VISIBLE_DEVICES=4,5,6 python model/train.py \
+#   --dataset codecontestplus \
+#   --dataset_path ~/lzh/datasets/codecontestplus \
+#   ...
+
+# APPS/train（目录结构见 get_codeforces_data/APPS/train）:
+CUDA_VISIBLE_DEVICES=4,5,6 python model/train.py \
+  --dataset apps \
+  --dataset_path ~/get_codeforces_data/APPS/train \
+  --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --devices cuda:0,cuda:1,cuda:2 \
+  --use_lora \
+  --gradient_checkpointing \
+  --inject_mode half \
+  --inject_value 10 \
+  --exec_timeout 10 \
+  --output_dir outputs/solver_rl \
+  --naive_bestofn 3 \
+  --solver_bestofn 3 \
+  --input_count 10 \
+  --start 0 --end 100 \
+  --epochs 1 \
+  --save_every 50

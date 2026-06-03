@@ -37,7 +37,7 @@ eval_outputs/
 # Datasets / large data (do not commit; keep alldatasets/**/*.py)
 alldatasets/**
 !alldatasets/**/
-!datasets/**/*.py
+!alldatasets/**/*.py
 data.txt
 
 # Legacy dataset paths (root-level vendor trees)

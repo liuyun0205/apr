@@ -41,6 +41,9 @@ class MultiTrainer:
         return completion_log_probs.mean()
 
     def update_agent(self, agent, prompt, code, reward):
+        if agent.optimizer is None:
+            raise RuntimeError("该 Agent 未启用训练（optimizer=None）")
+
         agent.model.train()
 
         advantage = torch.tensor(
@@ -69,27 +72,30 @@ class MultiTrainer:
 
         return loss.item()
 
-    def build_matrices(self, candidates):
+    def build_matrices(self, candidates, exec_kwargs=None):
 
         naive_codes = candidates["naive_codes"]
         solver_codes = candidates["solver_codes"]
         inputs = candidates["inputs"]
+        run_kw = exec_kwargs or {}
         all_matrices = []
         for input_case in inputs:
             matrix = []
             for solver_code in solver_codes:
                 row = []
-                solver_out = utils.run_code(
+                solver_out, _ = utils.run_solve(
                     solver_code,
-                    input_case
+                    input_case,
+                    **run_kw,
                 )
                 for naive_code in naive_codes:
-                    naive_out = utils.run_code(
+                    naive_out, _ = utils.run_solve(
                         naive_code,
-                        input_case
+                        input_case,
+                        **run_kw,
                     )
                     row.append(
-                        1 if solver_out == naive_out else 0
+                        1 if solver_out.strip() == naive_out.strip() else 0
                     )
                 matrix.append(row)
             all_matrices.append(matrix)
@@ -100,8 +106,13 @@ class MultiTrainer:
         all_matrices[input_idx][solver_idx][naive_idx]
         """
 
+        if not all_matrices:
+            return []
+
         num_inputs = len(all_matrices)
         num_solvers = len(all_matrices[0])
+        if num_solvers == 0:
+            return []
 
         rewards = [0.0] * num_solvers
 

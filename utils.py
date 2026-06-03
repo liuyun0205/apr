@@ -209,21 +209,43 @@ def clean_code(text: str) -> str:
 
     return text.strip()
 
-def run_code(code: str, timeout=10):
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".py",
-        delete=False,
-        encoding="utf-8"
-    ) as f:
-        f.write(code)
-        py_file = f.name
+def _inject_kwargs(kwargs):
+    return {
+        "mode": kwargs.get("inject_mode", "half"),
+        "value": kwargs.get("inject_value", 10),
+        "timeout": kwargs.get("timeout", 10),
+        "max_rounds": kwargs.get("inject_max_rounds", 32),
+        "enabled": kwargs.get("inject_backoff", True),
+    }
 
-    result = subprocess.run(
-        [sys.executable, py_file],
-        capture_output=True,
-        text=True,
-        timeout=10
+
+def run_code(code: str, timeout=10, **kwargs):
+    from injector import Injector
+
+    inj = _inject_kwargs({"timeout": timeout, **kwargs})
+    stdout, code_exit = Injector.run_with_backoff(code, **inj)
+    if code_exit == 255:
+        return stdout, "timeout"
+    if code_exit != 0:
+        return stdout, f"exit_{code_exit}"
+    return stdout, ""
+
+
+def run_solve(code: str, input_str: str, timeout=10, **kwargs):
+    """执行含 solve() 的脚本，对给定输入返回 stdout/stderr。"""
+    code = clean_code(code)
+    if not code.strip():
+        return "", "empty code"
+
+    runner = (
+        code
+        + "\n\n"
+        + "_apr_inp = " + repr(input_str) + "\n"
+        + "try:\n"
+        + "    _apr_res = solve(_apr_inp)\n"
+        + "except TypeError:\n"
+        + "    _apr_res = solve()\n"
+        + "if _apr_res is not None:\n"
+        + "    print(_apr_res, end='')\n"
     )
-
-    return result.stdout, result.stderr
+    return run_code(runner, timeout=timeout, **kwargs)
