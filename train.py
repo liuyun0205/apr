@@ -80,9 +80,9 @@ def main() -> None:
     texts = _read_jsonl_texts(args.train_jsonl, text_key="text")
 
     try:
-        from datasets import Dataset  # type: ignore
+        from alldatasets import Dataset  # type: ignore
     except Exception as e:
-        raise RuntimeError("请安装 datasets：`pip install datasets`（用于最简单的数据加载）。") from e
+        raise RuntimeError("请安装 alldatasets：`pip install alldatasets`（用于最简单的数据加载）。") from e
 
     ds = Dataset.from_dict({"text": texts})
 

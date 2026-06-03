@@ -168,7 +168,7 @@ def _lang_filename(lang: str) -> str:
     mapping = {
         "c": "main.c",
         "cpp": "main.cpp",
-        "python": "main.py",
+        "python": "model.py",
         "java": "Main.java",
         "javascript": "main.js",
         "kotlin": "main.kt",

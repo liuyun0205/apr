@@ -6,7 +6,7 @@ from config import get_args
 from utils import write2file,run_program,get_filename
 
 try:
-    from datasets.xcodeeval.sub_test_map import SubTestIndexMap, get_map
+    from alldatasets.xcodeeval.sub_test_map import SubTestIndexMap, get_map
 except ImportError:
     SubTestIndexMap = None  # type: ignore
     get_map = None  # type: ignore

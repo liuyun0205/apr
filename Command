@@ -1,7 +1,9 @@
-# sub_test 全量 + 本地模型
-MODEL=~/model/Qwen2___5-Coder-3B-Instruct
+# sub_test 全量 + 本地模型（vLLM，需 py311 等 Python>=3.10 且 pip install vllm）
+# 选卡：CUDA_VISIBLE_DEVICES=0  多卡并行：CUDA_VISIBLE_DEVICES=0,1,2 --tensor-parallel-size 3
+MODEL=~/lzh/Qwen2.5-Coder-7B-Instruct
 
-cd /home/liuzhihao/apr
+# conda activate py311
+# export CUDA_VISIBLE_DEVICES=0
 
 for f in datasets/xcodeeval/sub_test/LLVMIR.jsonl; do
   echo "=== EVAL $f ==="
@@ -16,19 +18,24 @@ done
 
 # 结果目录: results/local_Qwen2___5-Coder-3B-Instruct/<语言>/*.txt
 
-# ---------- API gpt-5-mini（直连 chshapi）----------
+# ---------- API 轮换（本地 freeapi/，不提交 git）----------
+# gpt-5.4：每节点/key 5 次后切换；gpt-5-mini：200 次（见 rotation_limits.py）
+ for f in datasets/xcodeeval/sub_test/LLVMIR.jsonl; do
+   python datasets/xcodeeval/eval.py --data "$f" --model gpt-5.4 --rotate --resume
+done
+#
+# ---------- API 直连 chshapi（不轮换）----------
 # export OPENAI_API_KEY='sk-...'
 # for f in datasets/xcodeeval/sub_test/*.jsonl; do
-#   echo "=== EVAL $f ==="
 #   python datasets/xcodeeval/eval.py \
-#     --data "$f" --model-type api --model gpt-5-mini \
+#     --data "$f" --model gpt-5-mini --no-rotate \
 #     --base-url https://api.chshapi.org \
 #     --result-dir results/direct_GPT_5-mini --resume
 # done
 #
 # ---------- 评测已有代码（各语言通过率）----------
   python datasets/xcodeeval/eval.py \
-  --score-dir results/GPT_5_mini \
+  --score-dir results/direct_Qwen2.5-Coder-7B-Instruct \
   --data-root datasets/xcodeeval/sub_test \
 
 
@@ -40,3 +47,18 @@ python datasets/xcodeeval/eval.py --score-dir results/direct_GPT_5-mini --data-r
 
 # 查第 5 题对应的真实 bug_code_uid
 python datasets/xcodeeval/sub_test_map.py lookup --lang Python --index 5 --id-field bug_code_uid
+
+先单独起 vLLM（示例）：
+
+vllm serve ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --port 8000 \
+  --served-model-name input_trriger
+客户端用 api / direct，不要再用 local：
+
+from LLM import LLM, LLMConfig
+llm = LLM(LLMConfig(
+    model_type="api",
+    model="Qwen2.5-Coder-7B-Instruct",   # 见下文：和 serve 暴露的名字一致
+    base_url="http://127.0.0.1:8000/v1/chat/completions",
+    system_prompt="...",
+))

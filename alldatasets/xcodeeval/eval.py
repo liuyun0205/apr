@@ -15,6 +15,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from LLM import DEFAULT_API_BASE_URL, LLM, LLMConfig, resolve_api_base_url  # noqa: E402
+from rotation_limits import rotation_limits_for_model  # noqa: E402
 from runner import run as run_testcases  # noqa: E402
 from utils import file2text  # noqa: E402
 
@@ -41,7 +42,7 @@ def parseArgs() -> argparse.Namespace:
     p.add_argument(
         "--data-root",
         type=str,
-        default="datasets/xcodeeval/sub_test",
+        default="alldatasets/xcodeeval/sub_test",
         help="score 模式：jsonl 元数据目录（按 <语言>.jsonl 对齐 bug_code_uid）",
     )
     p.add_argument(
@@ -72,13 +73,13 @@ def parseArgs() -> argparse.Namespace:
     p.add_argument(
         "--descriptions",
         type=str,
-        default="datasets/xcodeeval/problem_descriptions.jsonl",
+        default="alldatasets/xcodeeval/problem_descriptions.jsonl",
         help="problem_descriptions.jsonl 路径",
     )
     p.add_argument(
         "--tests",
         type=str,
-        default="datasets/xcodeeval/unittest_db.json",
+        default="alldatasets/xcodeeval/unittest_db.json",
         help="unittest_db.json（score 模式用于拉取用例）",
     )
     p.add_argument(
@@ -129,7 +130,33 @@ def parseArgs() -> argparse.Namespace:
         type=str,
         default="api",
         choices=["api", "local"],
-        help="api=远程 API；local=本地 Transformers",
+        help="api=远程 API；local=本地 vLLM",
+    )
+    p.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="local 模式：vLLM 张量并行 GPU 数（配合 CUDA_VISIBLE_DEVICES 选卡）",
+    )
+    p.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="local 模式：vLLM 显存占用比例（0~1）",
+    )
+    rot = p.add_mutually_exclusive_group()
+    rot.add_argument(
+        "--rotate",
+        dest="rotate",
+        action="store_true",
+        default=None,
+        help="api 模式：本地 freeapi 轮换 key/IP（默认；gpt-5.4 每节点 5 次，mini 200 次）",
+    )
+    rot.add_argument(
+        "--no-rotate",
+        dest="rotate",
+        action="store_false",
+        help="api 模式：固定 key 直连 chshapi，不轮换",
     )
     p.add_argument("--model", type=str, default="", help="模型名（生成模式必填）")
     p.add_argument(
@@ -209,11 +236,18 @@ def _safePathComponent(name: str) -> str:
 
 
 def normalizeModelArgs(args: argparse.Namespace) -> None:
-    """兼容旧 --model-type direct。"""
+    """兼容旧 --model-type direct，并解析 api 是否轮换。"""
     mt = (args.model_type or "").strip().lower()
     if mt == "direct":
-        print("提示: --model-type direct 已弃用，请改用 --model-type api", file=sys.stderr)
+        print("提示: --model-type direct 已弃用，请改用 --model-type api --no-rotate", file=sys.stderr)
         args.model_type = "api"
+        if getattr(args, "rotate", None) is not False:
+            args.rotate = False
+    if args.model_type == "api":
+        if getattr(args, "rotate", None) is None:
+            args.rotate = True
+    else:
+        args.rotate = False
 
 
 def loadUnittestDb(path: str) -> Dict[str, Any]:
@@ -274,8 +308,8 @@ def parseLangAllowlist(langs: str) -> Optional[set[str]]:
 def eval(
     result_dir: str,
     *,
-    data_root: str = "datasets/xcodeeval/sub_test",
-    unittest_path: str = "datasets/xcodeeval/unittest_db.json",
+    data_root: str = "alldatasets/xcodeeval/sub_test",
+    unittest_path: str = "alldatasets/xcodeeval/unittest_db.json",
     out_id_field: str = "index",
     report_path: str = "",
     resume: bool = False,
@@ -807,9 +841,29 @@ def buildLlmChat(args: argparse.Namespace, system_prompt: str):
                 model_type="local",
                 model=args.model,
                 system_prompt=system_prompt,
+                tensor_parallel_size=args.tensor_parallel_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
             )
         )
         return llm.chat, "local"
+
+    if args.rotate:
+        try:
+            from freeapi.free_llm import FreeLLM, FreeLLMConfig  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "轮换模式需要本地 freeapi/（已在 .gitignore，不会提交仓库）"
+            ) from e
+        node_limit, daily_limit = rotation_limits_for_model(args.model)
+        llm = FreeLLM(
+            FreeLLMConfig(
+                model=args.model,
+                system_prompt=system_prompt,
+                ip_key_node_limit=node_limit,
+                daily_limit=daily_limit,
+            )
+        )
+        return llm.chat, f"api+rotate (node={node_limit}, daily={daily_limit})"
 
     base_url = resolve_api_base_url(cli_base_url=args.base_url or "")
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("CHSHAPI_API_KEY")
@@ -837,8 +891,8 @@ def mainScore(args: argparse.Namespace) -> int:
         return 2
     eval(
         score_dir,
-        data_root=(args.data_root or "datasets/xcodeeval/sub_test").strip(),
-        unittest_path=(args.tests or "datasets/xcodeeval/unittest_db.json").strip(),
+        data_root=(args.data_root or "alldatasets/xcodeeval/sub_test").strip(),
+        unittest_path=(args.tests or "alldatasets/xcodeeval/unittest_db.json").strip(),
         out_id_field=(args.out_id_field or "index").strip(),
         report_path=(args.score_report or "").strip(),
         resume=bool(args.resume),
@@ -887,7 +941,7 @@ def main() -> int:
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 2
-    print(f"LLM 后端: {backend}")
+    print(f"LLM 后端: {backend}" + (" (freeapi 轮换)" if getattr(args, "rotate", False) else ""))
 
     result_dir = resolveResultDir(args)
     args.result_dir = result_dir

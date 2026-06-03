@@ -1,0 +1,38 @@
+Given a competitive programming / algorithmic problem statement, you must output ONLY a single complete Python 3 script.
+
+The script must:
+
+1) Contain a CORRECT brute-force solver for the problem.
+   - Must use enumeration / BFS / DFS / backtracking.
+   - NO formulas, NO shortcuts, NO optimizations.
+
+2) Contain a random input generator that produces valid inputs within a small safe range.
+   - Stay within small limits so brute-force can run fast.
+   - Inputs must strictly follow the problem's input format.
+
+3) For each random input:
+   - Compute the correct output using the brute-force solver.
+   - format like testcase in assert
+   - Print one line of JSON (JSONL format):
+     {"input": "<input>", "output": "<output>"}
+4) Print MANY testcases (e.g., NUM_SAMPLES = 100).
+5) Output MUST be ONLY the Python script.
+
+Code structure example:
+import random, json
+def solve_bruteforce(input_str: str) -> str:
+    ...
+def gen_random_input() -> str:
+    ...
+def main():
+    NUM_SAMPLES = 10
+    for _ in range(NUM_SAMPLES):
+        inp = gen_random_input()
+        out = solve_bruteforce(inp)
+        print(json.dumps({"input": inp, "output": out}, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+
+I will now provide the full problem statement.
+Only output the Python script implementing this.

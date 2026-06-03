@@ -126,10 +126,15 @@ def convert_dataset(
             ll_path = os.path.join(out_dir, f"{index}.ll")
             with open(ll_path, "w", encoding="utf-8") as f:
                 f.write(ir)
+            if isinstance(code, str) and code.strip():
+                src_path = os.path.join(out_dir, f"{index}.cpp")
+                with open(src_path, "w", encoding="utf-8") as f:
+                    f.write(code)
 
         row = dict(item)
         row["lang"] = "LLVM IR"
         row["lang_cluster"] = "LLVM IR"
+        row["original_source_code"] = code if isinstance(code, str) else ""
         row["bug_source_code"] = ir
         row["llvm_ir_from"] = "C++"
         row["llvm_ir_index"] = index
@@ -144,6 +149,20 @@ def convert_dataset(
     return stats
 
 
+def write_source_files(*, src_jsonl: str, out_dir: str, ext: str = ".cpp") -> int:
+    """仅把原始源码写入 out_dir/<index><ext>，不重新编译 IR。"""
+    os.makedirs(out_dir, exist_ok=True)
+    n = 0
+    for index, item in enumerate(_iter_jsonl(src_jsonl)):
+        code = item.get("bug_source_code") or ""
+        if not isinstance(code, str) or not code.strip():
+            continue
+        with open(os.path.join(out_dir, f"{index}{ext}"), "w", encoding="utf-8") as f:
+            f.write(code)
+        n += 1
+    return n
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="将 sub_test C++ 转为 LLVM IR 数据集")
     p.add_argument("--cpp-jsonl", type=str, default=DEFAULT_CPP_JSONL)
@@ -151,6 +170,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR)
     p.add_argument("--clang", type=str, default="clang++")
     p.add_argument("--no-ll-files", action="store_true", help="不写入 LLVM IR/<index>.ll")
+    p.add_argument("--sources-only", action="store_true", help="仅写入 LLVM IR/<index>.cpp，不编译 IR")
     p.add_argument("--rebuild-map", action="store_true", help="转换后重建 sub_test_index.json")
     return p.parse_args()
 
@@ -160,6 +180,12 @@ def main() -> int:
     if not os.path.isfile(args.cpp_jsonl):
         print(f"找不到：{args.cpp_jsonl}", file=sys.stderr)
         return 2
+
+    if args.sources_only:
+        n = write_source_files(src_jsonl=args.cpp_jsonl, out_dir=args.out_dir, ext=".cpp")
+        print(f"已写入 {n} 个 .cpp -> {args.out_dir}")
+        return 0
+
     if shutil.which(args.clang) is None:
         print(f"找不到编译器：{args.clang}", file=sys.stderr)
         return 2

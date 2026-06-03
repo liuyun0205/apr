@@ -34,9 +34,9 @@ result/
 eval_outputs/
 **/eval_report.json
 
-# Datasets / large data (do not commit; keep datasets/**/*.py)
-datasets/**
-!datasets/**/
+# Datasets / large data (do not commit; keep alldatasets/**/*.py)
+alldatasets/**
+!alldatasets/**/
 !datasets/**/*.py
 data.txt
 

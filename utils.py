@@ -1,6 +1,9 @@
 import os
+import re
 import shutil
 import subprocess
+import sys
+import tempfile
 from collections import Counter
 
 import subprocess
@@ -184,3 +187,43 @@ def count_outcome(dataset, language):
 
     counter = Counter(outcomes)
     return counter
+def clean_code(text: str) -> str:
+    """
+    提取 markdown 中的 python 代码块。
+    如果没有代码块则返回原文本。
+    """
+
+    pattern = r"```(?:python)?\s*\n(.*?)```"
+
+    matches = re.findall(
+        pattern,
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+
+    if matches:
+        return "\n\n".join(
+            code.strip()
+            for code in matches
+        )
+
+    return text.strip()
+
+def run_code(code: str, timeout=10):
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        delete=False,
+        encoding="utf-8"
+    ) as f:
+        f.write(code)
+        py_file = f.name
+
+    result = subprocess.run(
+        [sys.executable, py_file],
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+
+    return result.stdout, result.stderr

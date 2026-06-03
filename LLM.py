@@ -96,19 +96,26 @@ def _format_api_error(exc: Exception, *, url: str = "") -> str:
 class LLMConfig:
     """
     model_type:
-      - "local":  本地 Transformers
+      - "local":  本地 vLLM
       - "api" / "direct": POST 到 base_url（OpenAI 兼容 JSON body）
     """
 
     model_type: str  # "local" | "api" | "direct"
     model: str
+    model_path:str
     system_prompt: str = ""
+
 
     base_url: Optional[str] = None
     api_key: Optional[str] = None
 
     max_new_tokens: int = 512
     temperature: float = 0.7
+
+    # vLLM（local 模式）；选卡用 CUDA_VISIBLE_DEVICES=0,1,2
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_model_len: Optional[int] = None
 
     use_zero: bool = False
     zero_stage: int = 3
@@ -118,7 +125,7 @@ class LLMConfig:
 class LLM:
     def __init__(self, config: LLMConfig):
         self.config = config
-        self._backend: str = config.model_type.lower().strip()
+        self._backend= config.model_type.lower().strip()
 
         if self._backend not in {"local", "api", "direct"}:
             raise ValueError(
@@ -130,6 +137,7 @@ class LLM:
         self._client = None
         self._tokenizer = None
         self._model = None
+        self._sampling_params_cls = None
 
         if self._backend == "local":
             self._init_local()
@@ -137,36 +145,32 @@ class LLM:
             self._init_api()
 
     def _init_local(self) -> None:
+        if self.config.use_zero:
+            raise RuntimeError(
+                "local 模式已改用 vLLM，不再支持 --use_zero / DeepSpeed。"
+                "多卡请设 --tensor-parallel-size 或 CUDA_VISIBLE_DEVICES。"
+            )
+
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+            from vllm import LLM as VLLMEngine, SamplingParams  # type: ignore
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
-                "本地模型模式需要安装 transformers（以及 torch）。"
+                "本地模型模式需要 vLLM（Python>=3.10）。"
+                "示例：conda activate py311 && pip install vllm"
             ) from e
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.model)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.config.model,
-            device_map="auto",
-        )
+        self._sampling_params_cls = SamplingParams
+        vllm_kwargs: Dict[str, Any] = {
+            "model": self.config.model,
+            "tensor_parallel_size": max(1, int(self.config.tensor_parallel_size)),
+            "trust_remote_code": True,
+            "gpu_memory_utilization": float(self.config.gpu_memory_utilization),
+        }
+        if self.config.max_model_len is not None:
+            vllm_kwargs["max_model_len"] = int(self.config.max_model_len)
 
-        if self.config.use_zero:
-            try:
-                import deepspeed  # type: ignore
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError(
-                    "已启用 use_zero，但未安装 deepspeed。请先 `pip install deepspeed`。"
-                ) from e
-
-            mp_size = int(os.getenv("WORLD_SIZE", "1"))
-            engine = deepspeed.init_inference(
-                self._model,
-                mp_size=mp_size,
-                dtype=getattr(self._model, "dtype", None),
-                replace_method="auto",
-                replace_with_kernel_inject=True,
-            )
-            self._model = engine.module
+        self._model = VLLMEngine(**vllm_kwargs)
+        self._tokenizer = self._model.get_tokenizer()
 
     def _init_api(self) -> None:
         api_key = (
@@ -207,23 +211,41 @@ class LLM:
                 pass
         return self._messages_to_prompt(messages)
 
-    def _chat_local(self, user_content: str, system_prompt: str) -> str:
-        assert self._tokenizer is not None and self._model is not None
-
-        messages = self._build_messages(user_content, system_prompt)
-        prompt = self._encode_messages_for_local(messages)
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
-        input_len = inputs["input_ids"].shape[1]
-
-        outputs = self._model.generate(
-            **inputs,
-            max_new_tokens=self.config.max_new_tokens,
-            do_sample=True,
+    def _local_sampling_params(self) -> Any:
+        assert self._sampling_params_cls is not None
+        return self._sampling_params_cls(
             temperature=self.config.temperature,
+            max_tokens=self.config.max_new_tokens,
         )
 
-        new_tokens = outputs[0][input_len:]
-        return self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+    @staticmethod
+    def _vllm_output_text(outputs: Any) -> str:
+        if isinstance(outputs, str):
+            return outputs
+        if not outputs:
+            return ""
+        item = outputs[0] if isinstance(outputs, list) else outputs
+        if isinstance(item, str):
+            return item
+        out_list = getattr(item, "outputs", None)
+        if out_list:
+            return str(out_list[0].text)
+        return str(getattr(item, "text", item))
+
+    def _chat_local(self, user_content: str, system_prompt: str) -> str:
+        assert self._model is not None
+
+        messages = self._build_messages(user_content, system_prompt)
+        sampling = self._local_sampling_params()
+
+        chat_fn = getattr(self._model, "chat", None)
+        if callable(chat_fn):
+            return self._vllm_output_text(chat_fn(messages, sampling_params=sampling))
+
+        prompt = self._encode_messages_for_local(messages)
+        return self._vllm_output_text(
+            self._model.generate([prompt], sampling_params=sampling)
+        )
 
     def _chat_api(self, user_content: str, system_prompt: str) -> str:
         messages = self._build_messages(user_content, system_prompt)

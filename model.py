@@ -35,9 +35,8 @@ class model:
                 model_type="local",
                 model=self.model_name,
                 system_prompt=self.prompt,
-                use_zero=getattr(args, "use_zero", False),
-                zero_stage=getattr(args, "zero_stage", 3),
-                zero_offload=getattr(args, "zero_offload", "none"),
+                tensor_parallel_size=getattr(args, "tensor_parallel_size", 1),
+                gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.9),
             )
         )
 
