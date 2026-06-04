@@ -85,7 +85,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
   --val_seed 42
 
 # 验证集：启动时从 APPS 抽 300 题（有 input_output）→ output_dir/val_indices.json
-# 每 25 step 验证：mean_reward；pass@1=另生成 1 份 solver 对 GT；bestofn_pass=原 bestofN 任一全过
+# 验证：开局 update_step=0 基线；之后每 25 次真正 update 验证一次
 
 # 执行测例说明：
 #   --exec_timeout 30      单次子进程最多 30s（默认 10，慢题可加大）

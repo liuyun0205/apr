@@ -20,6 +20,11 @@ import utils  # noqa: E402
 from trainner import MultiTrainer  # noqa: E402
 from alldatasets.loader import load_dataset  # noqa: E402
 
+try:
+    from tqdm import tqdm  # noqa: E402
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore
+
 
 def _load_model_class():
     spec = importlib.util.spec_from_file_location(
@@ -207,7 +212,7 @@ def parse_args() -> argparse.Namespace:
         "--val_every",
         type=int,
         default=25,
-        help="每 N 个训练 step 在验证集上评估一次",
+        help="每 N 次参数更新后验证；训练前另跑 update_step=0 基线",
     )
     parser.add_argument(
         "--val_seed",
@@ -469,6 +474,7 @@ def run_validation(
     val_indices: List[int],
     *,
     global_step: int,
+    update_step: int,
     args: argparse.Namespace,
     output_dir: Path,
 ) -> Dict[str, Any]:
@@ -488,8 +494,18 @@ def run_validation(
     pass_n = 0
     bestofn_pass_n = 0
 
+    iter_val = val_indices
+    if tqdm is not None:
+        iter_val = tqdm(
+            val_indices,
+            desc=f"val update_step={update_step} train_step={global_step}",
+            unit="题",
+            dynamic_ncols=True,
+            file=sys.stderr,
+        )
+
     try:
-        for v_idx in val_indices:
+        for v_idx in iter_val:
             question = dataset.get_by_tag("description", v_idx)
             st = eval_one(
                 model,
@@ -522,7 +538,18 @@ def run_validation(
                     pass_n += 1
                 if st.get("bestofn_pass"):
                     bestofn_pass_n += 1
+
+            if tqdm is not None and hasattr(iter_val, "set_postfix"):
+                iter_val.set_postfix(
+                    ok=ok_n,
+                    skip=skip_n,
+                    p1=pass_n,
+                    bn=bestofn_pass_n,
+                    refresh=False,
+                )
     finally:
+        if tqdm is not None and hasattr(iter_val, "close"):
+            iter_val.close()
         if was_training:
             model.solver.model.train()
 
@@ -530,7 +557,8 @@ def run_validation(
     pass_at_1_rate = pass_n / ok_n if ok_n else 0.0
     bestofn_pass_rate = bestofn_pass_n / ok_n if ok_n else 0.0
     summary = {
-        "step": global_step,
+        "train_step": global_step,
+        "update_step": update_step,
         "n_val": len(val_indices),
         "n_ok": ok_n,
         "n_skip": skip_n,
@@ -638,6 +666,8 @@ def train_loop(
 
     end = args.end if args.end is not None else len(dataset.df)
     global_step = 0
+    update_step = 0
+    last_val_update_step = -1
 
     summary = logging.getLogger(TRAIN_SUMMARY_LOGGER)
 
@@ -657,6 +687,33 @@ def train_loop(
             len(train_indices),
             str(output_dir / "val_indices.json"),
         )
+
+    if val_indices and args.val_every > 0:
+        val_stats = run_validation(
+            model,
+            trainer,
+            dataset,
+            val_indices,
+            global_step=0,
+            update_step=0,
+            args=args,
+            output_dir=output_dir,
+        )
+        summary.info(
+            "val update_step=0 train_step=0 n=%d ok=%d skip=%d "
+            "pass@1=%.4f (%d/%d) bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+            val_stats.get("n_val", 0),
+            val_stats.get("n_ok", 0),
+            val_stats.get("n_skip", 0),
+            float(val_stats.get("pass_at_1", 0.0)),
+            val_stats.get("n_pass_at_1", 0),
+            val_stats.get("n_ok", 0),
+            float(val_stats.get("bestofn_pass_rate", 0.0)),
+            val_stats.get("n_bestofn_pass", 0),
+            val_stats.get("n_ok", 0),
+            float(val_stats.get("mean_reward", 0.0)),
+        )
+        last_val_update_step = 0
 
     for epoch in range(args.epochs):
         if args.debug:
@@ -685,6 +742,11 @@ def train_loop(
                 "id": str(problem_id),
                 **stats,
             }
+            did_update = False
+            if not stats.get("skipped") and int(stats.get("updated") or 0) > 0:
+                update_step += 1
+                record["update_step"] = update_step
+                did_update = True
             append_jsonl(log_path, record)
 
             if stats.get("skipped"):
@@ -713,7 +775,8 @@ def train_loop(
             if (
                 val_indices
                 and args.val_every > 0
-                and global_step % args.val_every == 0
+                and did_update
+                and update_step % args.val_every == 0
             ):
                 val_stats = run_validation(
                     model,
@@ -721,12 +784,14 @@ def train_loop(
                     dataset,
                     val_indices,
                     global_step=global_step,
+                    update_step=update_step,
                     args=args,
                     output_dir=output_dir,
                 )
                 summary.info(
-                    "val step=%d n=%d ok=%d skip=%d pass@1=%.4f (%d/%d) "
-                    "bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+                    "val update_step=%d train_step=%d n=%d ok=%d skip=%d "
+                    "pass@1=%.4f (%d/%d) bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+                    update_step,
                     global_step,
                     val_stats.get("n_val", 0),
                     val_stats.get("n_ok", 0),
@@ -739,21 +804,29 @@ def train_loop(
                     val_stats.get("n_ok", 0),
                     float(val_stats.get("mean_reward", 0.0)),
                 )
+                last_val_update_step = update_step
 
     save_checkpoint(model, output_dir, "final")
-    if val_indices and args.val_every > 0:
+    if (
+        val_indices
+        and args.val_every > 0
+        and update_step > 0
+        and update_step != last_val_update_step
+    ):
         val_stats = run_validation(
             model,
             trainer,
             dataset,
             val_indices,
             global_step=global_step,
+            update_step=update_step,
             args=args,
             output_dir=output_dir,
         )
         summary.info(
-            "val step=%d (final) n=%d ok=%d skip=%d pass@1=%.4f (%d/%d) "
-            "bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+            "val update_step=%d (final) train_step=%d n=%d ok=%d skip=%d "
+            "pass@1=%.4f (%d/%d) bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+            update_step,
             global_step,
             val_stats.get("n_val", 0),
             val_stats.get("n_ok", 0),
