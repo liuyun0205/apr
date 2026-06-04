@@ -176,10 +176,13 @@ class Injector:
         return modified_content, changed
 
     @staticmethod
-    def run_file(file_path: str, timeout: int = 10) -> Tuple[str, int]:
+    def run_file(
+        file_path: str,
+        timeout: int = 10,
+        stdin: str = "",
+    ) -> Tuple[str, int, str]:
         try:
-            result = subprocess.run(
-                [sys.executable, file_path],
+            run_kw = dict(
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -187,9 +190,16 @@ class Injector:
                 check=False,
                 timeout=timeout,
             )
-            return result.stdout.strip(), result.returncode
+            if stdin:
+                run_kw["input"] = stdin
+            result = subprocess.run(
+                [sys.executable, file_path],
+                **run_kw,
+            )
+            stderr = (result.stderr or "").strip()
+            return result.stdout.strip(), result.returncode, stderr
         except subprocess.TimeoutExpired:
-            return "Timeout", EXIT_TIMEOUT
+            return "Timeout", EXIT_TIMEOUT, ""
 
     @staticmethod
     def run_with_backoff(
@@ -200,10 +210,12 @@ class Injector:
         timeout: int = 10,
         max_rounds: int = 32,
         enabled: bool = True,
+        label: str = "",
+        stdin: str = "",
     ) -> Tuple[str, int]:
         """
         执行 Python 源码；超时则 injection 缩小 random 范围后重试。
-        返回 (stdout, exit_code)，255 表示最终仍超时。
+        返回 (stdout, exit_code, stderr)。255 表示子进程超时（真慢），非 255 且非 0 多为 Python 报错。
         """
         if not enabled or mode == "none":
             path = None
@@ -216,7 +228,9 @@ class Injector:
                 ) as f:
                     f.write(content)
                     path = f.name
-                return Injector.run_file(path, timeout=timeout)
+                out = Injector.run_file(path, timeout=timeout, stdin=stdin)
+                Injector._log_run_result(out[1], out[2], label, timeout)
+                return out[0], out[1]
             finally:
                 if path:
                     try:
@@ -227,6 +241,7 @@ class Injector:
         current = content
         last_stdout = "Timeout"
         last_code = EXIT_TIMEOUT
+        last_stderr = ""
 
         for round_idx in range(max_rounds):
             path = None
@@ -240,20 +255,30 @@ class Injector:
                     f.write(current)
                     path = f.name
 
-                stdout, code = Injector.run_file(path, timeout=timeout)
-                last_stdout, last_code = stdout, code
+                stdout, code, stderr = Injector.run_file(
+                    path, timeout=timeout, stdin=stdin
+                )
+                last_stdout, last_code, last_stderr = stdout, code, stderr
                 if code != EXIT_TIMEOUT:
+                    Injector._log_run_result(code, stderr, label, timeout)
                     return stdout, code
 
+                who = f" [{label}]" if label else ""
                 logger.info(
-                    "执行超时，注入退避 round=%d mode=%s value=%s",
+                    "子进程真超时(%ds)，注入退避%s round=%d mode=%s value=%s",
+                    timeout,
+                    who,
                     round_idx + 1,
                     mode,
                     value,
                 )
                 current, ok = Injector.injection(mode, current, value=value)
                 if not ok:
-                    logger.warning("无法继续 injection（无 random 范围可缩小）")
+                    logger.warning(
+                        "无法继续 injection（无 random 范围可缩小）%s；此前 stderr=%s",
+                        f" [{label}]" if label else "",
+                        (last_stderr or "")[:400],
+                    )
                     return last_stdout, last_code
             finally:
                 if path:
@@ -262,4 +287,24 @@ class Injector:
                     except OSError:
                         pass
 
+        logger.warning(
+            "退避后仍超时(%ds)%s，按 Timeout 处理",
+            timeout,
+            f" [{label}]" if label else "",
+        )
         return last_stdout, last_code
+
+    @staticmethod
+    def _log_run_result(code: int, stderr: str, label: str, timeout: int) -> None:
+        who = f" [{label}]" if label else ""
+        if code == 0:
+            return
+        if code == EXIT_TIMEOUT:
+            return
+        preview = (stderr or "(无 stderr，可能 solve 未定义或入口错误)")[:800]
+        logger.warning(
+            "执行报错(非超时，几秒内退出)%s exit=%s stderr=%s",
+            who,
+            code,
+            preview,
+        )

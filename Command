@@ -48,46 +48,60 @@ python datasets/xcodeeval/eval.py --score-dir results/direct_GPT_5-mini --data-r
 # 查第 5 题对应的真实 bug_code_uid
 python datasets/xcodeeval/sub_test_map.py lookup --lang Python --index 5 --id-field bug_code_uid
 
-先单独起 vLLM（示例）：
+# ---------- 训练（推荐：1×vLLM 批量推理 + HF LoRA 训 solver）----------
+# 7 卡物理 1-7（不用 GPU0）：
+#   CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+#   vLLM tp 须整除 28（1/2/4/7），不能用 6
+#   推荐：cuda:0-3 → vLLM(tp=4)，cuda:6 → solver 训练（物理卡 7）
+#
+# 依赖：pip install vllm peft torch transformers
 
-vllm serve ~/lzh/Qwen2.5-Coder-7B-Instruct \
-  --port 8000 \
-  --served-model-name input_trriger
-客户端用 api / direct，不要再用 local：
+cd ~/lzh/apr
 
-from LLM import LLM, LLMConfig
-llm = LLM(LLMConfig(
-    model_type="api",
-    model="Qwen2.5-Coder-7B-Instruct",   # 见下文：和 serve 暴露的名字一致
-    base_url="http://127.0.0.1:8000/v1/chat/completions",
-    system_prompt="...",
-))
-
-
-
-cd /home/lzh/apr
-# 设置 CUDA_VISIBLE_DEVICES 后，进程内只有 cuda:0,1,2（对应物理卡 4,5,6）
-# CodeContestPlus:
-# CUDA_VISIBLE_DEVICES=4,5,6 python model/train.py \
-#   --dataset codecontestplus \
-#   --dataset_path ~/lzh/datasets/codecontestplus \
-#   ...
-
-# APPS/train（目录结构见 get_codeforces_data/APPS/train）:
-CUDA_VISIBLE_DEVICES=4,5,6 python model/train.py \
+# APPS
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
   --dataset apps \
-  --dataset_path ~/get_codeforces_data/APPS/train \
+  --dataset_path ~/lzh/datasets/APPS/train \
   --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
-  --devices cuda:0,cuda:1,cuda:2 \
+  --chat_backend vllm \
+  --vllm_tp_size 4 \
+  --devices cuda:6 \
   --use_lora \
   --gradient_checkpointing \
   --inject_mode half \
   --inject_value 10 \
-  --exec_timeout 10 \
+  --exec_timeout 30 \
+  --exec_workers 8 \
   --output_dir outputs/solver_rl \
   --naive_bestofn 3 \
   --solver_bestofn 3 \
   --input_count 10 \
-  --start 0 --end 100 \
+  --input_source input_output \
+  --start 0 --end 5000 \
   --epochs 1 \
-  --save_every 50
+  --save_every 50 \
+  --val_size 300 \
+  --val_every 25 \
+  --val_seed 42
+
+# 验证集：启动时从 APPS 抽 300 题（有 input_output）→ output_dir/val_indices.json
+# 每 25 step 验证：mean_reward；pass@1=另生成 1 份 solver 对 GT；bestofn_pass=原 bestofN 任一全过
+
+# 执行测例说明：
+#   --exec_timeout 30      单次子进程最多 30s（默认 10，慢题可加大）
+#   --inject_mode half     超时后缩小 random 上界再试（naive 暴力常见）
+#   --no_inject_backoff    调试：超时直接失败，不打「注入退避」、不 retry
+
+# CodeContestPlus（改 dataset 即可）
+# CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
+#   --dataset codecontestplus \
+#   --dataset_path ~/lzh/datasets/codecontestplus \
+#   --chat_backend vllm --vllm_tp_size 4 --devices cuda:6 --use_lora ...
+
+# 回退三卡全 HF（无 vLLM）：
+# CUDA_VISIBLE_DEVICES=0,1,2 python model/train.py \
+#   --chat_backend hf --devices cuda:0,cuda:1,cuda:2 --use_lora ...
+
+# 单独起 vLLM API 服务（评测/脚本用，非 train.py 必需）：
+# CUDA_VISIBLE_DEVICES=0 vllm serve ~/lzh/Qwen2.5-Coder-7B-Instruct \
+#   --port 8000 --served-model-name Qwen2.5-Coder-7B-Instruct

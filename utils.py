@@ -209,20 +209,33 @@ def clean_code(text: str) -> str:
 
     return text.strip()
 
+
 def _inject_kwargs(kwargs):
+    kw = dict(kwargs)
+    label = kw.pop("exec_label", "") or ""
+    stdin = kw.pop("stdin", kw.pop("input", ""))
+    if stdin is None:
+        stdin = ""
     return {
-        "mode": kwargs.get("inject_mode", "half"),
-        "value": kwargs.get("inject_value", 10),
-        "timeout": kwargs.get("timeout", 10),
-        "max_rounds": kwargs.get("inject_max_rounds", 32),
-        "enabled": kwargs.get("inject_backoff", True),
-    }
+        "mode": kw.get("inject_mode", "half"),
+        "value": kw.get("inject_value", 10),
+        "timeout": kw.get("timeout", 10),
+        "max_rounds": kw.get("inject_max_rounds", 32),
+        "enabled": kw.get("inject_backoff", True),
+        "label": label,
+        "stdin": stdin,
+    }, kw
 
 
-def run_code(code: str, timeout=10, **kwargs):
+def run_code(code: str, input_str: str = "", timeout=10, **kwargs):
     from injector import Injector
 
-    inj = _inject_kwargs({"timeout": timeout, **kwargs})
+    inj, _rest = _inject_kwargs({
+        "timeout": timeout,
+        "input": input_str,
+        "stdin": input_str,
+        **kwargs,
+    })
     stdout, code_exit = Injector.run_with_backoff(code, **inj)
     if code_exit == 255:
         return stdout, "timeout"
@@ -232,20 +245,60 @@ def run_code(code: str, timeout=10, **kwargs):
 
 
 def run_solve(code: str, input_str: str, timeout=10, **kwargs):
-    """执行含 solve() 的脚本，对给定输入返回 stdout/stderr。"""
+    """直接执行生成的脚本，经 stdin 喂入测例（main 里 sys.stdin.read()）。"""    
     code = clean_code(code)
     if not code.strip():
         return "", "empty code"
+    return run_code(code, input_str=input_str, timeout=timeout, **kwargs)
 
-    runner = (
-        code
-        + "\n\n"
-        + "_apr_inp = " + repr(input_str) + "\n"
-        + "try:\n"
-        + "    _apr_res = solve(_apr_inp)\n"
-        + "except TypeError:\n"
-        + "    _apr_res = solve()\n"
-        + "if _apr_res is not None:\n"
-        + "    print(_apr_res, end='')\n"
-    )
-    return run_code(runner, timeout=timeout, **kwargs)
+
+def run_solve_ok(stderr: str) -> bool:
+    """子进程是否正常结束（非超时、非 exit 报错、非空代码）。"""
+    return (stderr or "") == ""
+
+
+def normalize_output(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").strip()
+
+
+def outputs_match(actual: str, expected: str) -> bool:
+    return normalize_output(actual) == normalize_output(expected)
+
+
+def solver_passes_all_cases(
+    code: str,
+    inputs: list,
+    expected_outputs: list,
+    **run_kw,
+) -> bool:
+    """单份代码是否通过全部 (input, output) 测例。"""
+    code = clean_code(code)
+    if not code.strip():
+        return False
+    if len(inputs) != len(expected_outputs) or not inputs:
+        return False
+    for inp, exp in zip(inputs, expected_outputs):
+        stdout, stderr = run_solve(code, inp, **run_kw)
+        if not run_solve_ok(stderr) or not outputs_match(stdout, exp):
+            return False
+    return True
+
+
+def solver_pass_at_1(
+    solver_codes: list,
+    inputs: list,
+    expected_outputs: list,
+    **run_kw,
+) -> bool:
+    """pass@1：任一 solver 候选通过全部测例即为 True。"""
+    for code in solver_codes:
+        if solver_passes_all_cases(code, inputs, expected_outputs, **run_kw):
+            return True
+    return False
+
+
+def _run_solve_worker(payload):
+    """ProcessPool 可 pickle 的顶层函数。返回 (stdout, stderr)。"""
+    code, input_str, kwargs = payload
+    stdout, stderr = run_solve(code, input_str, **kwargs)
+    return stdout.strip(), stderr or ""

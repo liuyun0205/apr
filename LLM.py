@@ -159,6 +159,9 @@ class LLM:
                 "示例：conda activate py311 && pip install vllm"
             ) from e
 
+        # 关闭 vLLM 控制台 tqdm / 冗长 INFO（Processed prompts / Adding requests）
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+
         self._sampling_params_cls = SamplingParams
         vllm_kwargs: Dict[str, Any] = {
             "model": self.config.model,
@@ -184,11 +187,21 @@ class LLM:
         self._client_meta = {"base_url": base_url, "api_key": api_key}
 
     def chat(self, user_content: str, *, system_prompt: Optional[str] = None) -> str:
+        return self.chat_batch([user_content], system_prompt=system_prompt)[0]
+
+    def chat_batch(
+        self,
+        user_contents: List[str],
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> List[str]:
+        if not user_contents:
+            return []
         sys_prompt = self.config.system_prompt if system_prompt is None else system_prompt
 
         if self._backend == "local":
-            return self._chat_local(user_content, sys_prompt)
-        return self._chat_api(user_content, sys_prompt)
+            return self._chat_batch_local(user_contents, sys_prompt)
+        return [self._chat_api(u, sys_prompt) for u in user_contents]
 
     def _build_messages(self, user_content: str, system_prompt: str) -> List[Dict[str, str]]:
         messages: List[Dict[str, str]] = []
@@ -233,19 +246,35 @@ class LLM:
         return str(getattr(item, "text", item))
 
     def _chat_local(self, user_content: str, system_prompt: str) -> str:
+        return self._chat_batch_local([user_content], system_prompt)[0]
+
+    def _vllm_generate_batch(self, prompts: List[str], sampling: Any) -> List[Any]:
+        """批量 generate，并尽量关闭 tqdm。"""
+        try:
+            return self._model.generate(
+                prompts,
+                sampling_params=sampling,
+                use_tqdm=False,
+            )
+        except TypeError:
+            return self._model.generate(prompts, sampling_params=sampling)
+
+    def _chat_batch_local(
+        self,
+        user_contents: List[str],
+        system_prompt: str,
+    ) -> List[str]:
         assert self._model is not None
 
-        messages = self._build_messages(user_content, system_prompt)
         sampling = self._local_sampling_params()
-
-        chat_fn = getattr(self._model, "chat", None)
-        if callable(chat_fn):
-            return self._vllm_output_text(chat_fn(messages, sampling_params=sampling))
-
-        prompt = self._encode_messages_for_local(messages)
-        return self._vllm_output_text(
-            self._model.generate([prompt], sampling_params=sampling)
-        )
+        messages_list = [
+            self._build_messages(u, system_prompt) for u in user_contents
+        ]
+        prompts = [
+            self._encode_messages_for_local(m) for m in messages_list
+        ]
+        outputs = self._vllm_generate_batch(prompts, sampling)
+        return [self._vllm_output_text([o]) for o in outputs]
 
     def _chat_api(self, user_content: str, system_prompt: str) -> str:
         messages = self._build_messages(user_content, system_prompt)

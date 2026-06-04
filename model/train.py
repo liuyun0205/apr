@@ -5,9 +5,10 @@ import importlib.util
 import json
 import logging
 import os
+import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 MODEL_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODEL_DIR.parent
@@ -31,6 +32,36 @@ def _load_model_class():
 
 
 Model = _load_model_class()
+
+# Qwen2.5-Coder-7B 等：attention heads=28，vLLM tp 必须整除
+DEFAULT_NUM_ATTENTION_HEADS = 28
+
+
+def resolve_vllm_tp(
+    requested: int,
+    num_gpus: int,
+    *,
+    num_heads: int = DEFAULT_NUM_ATTENTION_HEADS,
+) -> int:
+    """选取不超过 requested 且能整除 num_heads 的最大 tp。"""
+    if num_gpus < 2:
+        return 1
+    cap = min(max(1, requested), num_gpus - 1)
+    for tp in range(cap, 0, -1):
+        if num_heads % tp == 0:
+            if tp != requested:
+                logging.warning(
+                    "vllm_tp_size=%d 不合法（%d 个头不能整除），已改为 %d。"
+                    "可选: %s",
+                    requested,
+                    num_heads,
+                    tp,
+                    [x for x in (1, 2, 4, 7, 14, 28) if x <= cap and num_heads % x == 0],
+                )
+            return tp
+    raise ValueError(
+        f"无法为 {num_heads} 个 attention head 选择 vLLM tp（可见 GPU={num_gpus}）"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--devices",
         type=str,
-        default="cuda:0,cuda:1,cuda:2",
-        help="三个 Agent 的设备；若设置了 CUDA_VISIBLE_DEVICES，请用 cuda:0,1,2",
+        default="",
+        help="hf: cuda:0,1,2；vllm: solver 训练卡，默认 cuda:6（7 卡 1-7 时 vLLM 占 cuda:0..5）",
     )
     parser.add_argument("--output_dir", type=str, default="outputs/solver_rl")
     parser.add_argument("--naive_bestofn", type=int, default=3)
@@ -77,6 +108,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument("--log_file", type=str, default="")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="打印全部日志；默认仅每步一行 step/rewards/losses",
+    )
     parser.add_argument(
         "--use_lora",
         action="store_true",
@@ -117,10 +153,97 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="关闭注入退避，超时直接失败",
     )
+    parser.add_argument(
+        "--exec_workers",
+        type=int,
+        default=8,
+        help="run_solve 并行进程数（仅 CPU 子进程打分矩阵；1=串行）",
+    )
+    parser.add_argument(
+        "--chat_backend",
+        type=str,
+        default="vllm",
+        choices=["hf", "vllm"],
+        help="默认 vllm：单实例批量 chat；hf=三卡 HuggingFace",
+    )
+    parser.add_argument(
+        "--vllm_tp_size",
+        type=int,
+        default=4,
+        help="vLLM tensor parallel（须整除 28：1/2/4/7；7 卡推荐 4）",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.85,
+        help="vLLM 显存占用比例",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=1024,
+        help="chat 最大生成 token",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="chat 采样温度",
+    )
+    parser.add_argument(
+        "--input_source",
+        type=str,
+        default="input_output",
+        choices=["trigger", "input_output", "auto"],
+        help="测例来源：input_output=APPS 官方 inputs；trigger=模型生成；auto=先 io 后 trigger",
+    )
+    parser.add_argument(
+        "--val_size",
+        type=int,
+        default=300,
+        help="从 APPS 抽取验证集题数（需有 input_output）；0=关闭验证",
+    )
+    parser.add_argument(
+        "--val_every",
+        type=int,
+        default=25,
+        help="每 N 个训练 step 在验证集上评估一次",
+    )
+    parser.add_argument(
+        "--val_seed",
+        type=int,
+        default=42,
+        help="验证集抽样随机种子（可复现）",
+    )
+    parser.add_argument(
+        "--val_indices_file",
+        type=str,
+        default="",
+        help="验证集 idx 列表 JSON；存在则加载，否则抽样并写入 output_dir/val_indices.json",
+    )
+    parser.add_argument(
+        "--val_input_count",
+        type=int,
+        default=0,
+        help="验证时每题测例数；0=与 --input_count 相同",
+    )
     return parser.parse_args()
 
 
-def validate_devices(devices: tuple[str, ...]) -> None:
+def parse_devices_arg(devices_str: str, chat_backend: str) -> tuple[str, ...]:
+    devices = tuple(d.strip() for d in devices_str.split(",") if d.strip())
+    if chat_backend == "vllm":
+        if not devices:
+            devices = ("cuda:6",)
+        return devices
+    if not devices:
+        devices = ("cuda:0", "cuda:1", "cuda:2")
+    if len(devices) != 3:
+        raise ValueError("--devices 需要 3 个设备，例如 cuda:0,cuda:1,cuda:2")
+    return devices
+
+
+def validate_devices(devices: tuple[str, ...], chat_backend: str = "hf") -> None:
     try:
         import torch
     except ImportError as e:
@@ -144,16 +267,56 @@ def validate_devices(devices: tuple[str, ...]) -> None:
             )
 
 
-def setup_logging(log_file: str) -> None:
-    handlers: List[logging.Handler] = [logging.StreamHandler()]
+def validate_vllm_layout(
+    devices: tuple[str, ...],
+    vllm_tp_size: int,
+) -> int:
+    import torch
+
+    n = torch.cuda.device_count()
+    tp = resolve_vllm_tp(vllm_tp_size, n)
+    solver_idx = int(devices[-1].split(":")[1])
+    if solver_idx < tp:
+        raise ValueError(
+            f"vLLM 占用 cuda:0..cuda:{tp - 1}，solver 训练卡 cuda:{solver_idx} 与之冲突。"
+            f"请设 --devices cuda:{tp} 或更大（7 卡常用 --vllm_tp_size 4 --devices cuda:6）"
+        )
+    return tp
+
+
+TRAIN_SUMMARY_LOGGER = "apr.train"
+
+
+class _TrainSummaryOnlyFilter(logging.Filter):
+    """非 debug 时只放行 apr.train 的 step 摘要行。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name == TRAIN_SUMMARY_LOGGER
+
+
+def setup_logging(log_file: str, *, debug: bool = False) -> None:
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    if not debug:
+        stream.addFilter(_TrainSummaryOnlyFilter())
+    stream.setLevel(logging.INFO)
+    root.addHandler(stream)
+
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=handlers,
-    )
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        if not debug:
+            fh.addFilter(_TrainSummaryOnlyFilter())
+        fh.setLevel(logging.INFO)
+        root.addHandler(fh)
+
+    logging.getLogger(TRAIN_SUMMARY_LOGGER).setLevel(logging.INFO)
 
 
 def _exec_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -162,6 +325,7 @@ def _exec_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "inject_value": args.inject_value,
         "timeout": args.exec_timeout,
         "inject_backoff": not args.no_inject_backoff,
+        "exec_workers": max(1, args.exec_workers),
     }
 
 
@@ -170,6 +334,7 @@ def one_step(
     trainer: MultiTrainer,
     question: str,
     *,
+    idx: int,
     naive_bestofn: int,
     solver_bestofn: int,
     input_count: int,
@@ -182,6 +347,7 @@ def one_step(
         solver_bestofn,
         question,
         input_count=input_count,
+        idx=idx,
     )
     inputs = candidates.get("inputs") or []
     if not inputs:
@@ -214,10 +380,169 @@ def one_step(
     return {
         "skipped": False,
         "num_inputs": len(inputs),
+        "input_source": candidates.get("input_source"),
         "rewards": rewards,
         "losses": losses,
         "updated": updated,
     }
+
+
+def eval_one(
+    model: Any,
+    trainer: MultiTrainer,
+    question: str,
+    *,
+    idx: int,
+    naive_bestofn: int,
+    solver_bestofn: int,
+    input_count: int,
+    exec_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """单题验证：只打分，不更新参数。"""
+    candidates = model.generate_candidates(
+        naive_bestofn,
+        solver_bestofn,
+        question,
+        input_count=input_count,
+        idx=idx,
+    )
+    inputs = candidates.get("inputs") or []
+    if not inputs:
+        return {"skipped": True, "reason": "no_inputs", "mean_reward": 0.0}
+
+    matrices = trainer.build_matrices(candidates, exec_kwargs=exec_kwargs or {})
+    if not matrices or not matrices[0]:
+        return {"skipped": True, "reason": "empty_matrices", "mean_reward": 0.0}
+
+    rewards = trainer.calc_solver_rewards(matrices)
+    mean_r = sum(rewards) / len(rewards) if rewards else 0.0
+
+    run_kw = exec_kwargs or {}
+    expected = _load_gt_outputs(model, idx, len(inputs))
+    exp_slice = expected[: len(inputs)] if expected else []
+
+    bestofn_pass = False
+    if exp_slice and len(exp_slice) >= len(inputs):
+        bestofn_pass = utils.solver_pass_at_1(
+            candidates["solver_codes"],
+            inputs,
+            exp_slice,
+            **run_kw,
+        )
+
+    pass_at_1 = False
+    if exp_slice and len(exp_slice) >= len(inputs):
+        fresh_codes = model.generate_solver_codes(question, n=1)
+        if fresh_codes:
+            pass_at_1 = utils.solver_passes_all_cases(
+                fresh_codes[0],
+                inputs,
+                exp_slice,
+                **run_kw,
+            )
+
+    return {
+        "skipped": False,
+        "num_inputs": len(inputs),
+        "rewards": rewards,
+        "mean_reward": mean_r,
+        "max_reward": max(rewards) if rewards else 0.0,
+        "bestofn_pass": bestofn_pass,
+        "pass_at_1": pass_at_1,
+    }
+
+
+def _load_gt_outputs(model: Any, idx: int, max_count: int) -> List[str]:
+    getter_out = getattr(model.dataset, "get_io_outputs", None)
+    if not callable(getter_out):
+        return []
+    try:
+        return list(getter_out(idx, max_count=max_count))
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def run_validation(
+    model: Any,
+    trainer: MultiTrainer,
+    dataset: Any,
+    val_indices: List[int],
+    *,
+    global_step: int,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """在固定验证集上评估当前 solver（无梯度）。"""
+    if not val_indices:
+        return {"skipped": True, "reason": "no_val_indices"}
+
+    was_training = model.solver.model.training
+    model.solver.model.eval()
+
+    input_count = args.val_input_count or args.input_count
+    exec_kwargs = _exec_kwargs(args)
+    per_problem: List[Dict[str, Any]] = []
+    reward_sum = 0.0
+    ok_n = 0
+    skip_n = 0
+    pass_n = 0
+    bestofn_pass_n = 0
+
+    try:
+        for v_idx in val_indices:
+            question = dataset.get_by_tag("description", v_idx)
+            st = eval_one(
+                model,
+                trainer,
+                question,
+                idx=v_idx,
+                naive_bestofn=args.naive_bestofn,
+                solver_bestofn=args.solver_bestofn,
+                input_count=input_count,
+                exec_kwargs=exec_kwargs,
+            )
+            per_problem.append(
+                {
+                    "idx": v_idx,
+                    "id": str(dataset.get_by_tag("id", v_idx)),
+                    "skipped": st.get("skipped", False),
+                    "reason": st.get("reason", ""),
+                    "mean_reward": round(float(st.get("mean_reward", 0.0)), 4),
+                    "max_reward": round(float(st.get("max_reward", 0.0)), 4),
+                    "bestofn_pass": bool(st.get("bestofn_pass", False)),
+                    "pass_at_1": bool(st.get("pass_at_1", False)),
+                }
+            )
+            if st.get("skipped"):
+                skip_n += 1
+            else:
+                ok_n += 1
+                reward_sum += float(st.get("mean_reward", 0.0))
+                if st.get("pass_at_1"):
+                    pass_n += 1
+                if st.get("bestofn_pass"):
+                    bestofn_pass_n += 1
+    finally:
+        if was_training:
+            model.solver.model.train()
+
+    mean_reward = reward_sum / ok_n if ok_n else 0.0
+    pass_at_1_rate = pass_n / ok_n if ok_n else 0.0
+    bestofn_pass_rate = bestofn_pass_n / ok_n if ok_n else 0.0
+    summary = {
+        "step": global_step,
+        "n_val": len(val_indices),
+        "n_ok": ok_n,
+        "n_skip": skip_n,
+        "n_pass_at_1": pass_n,
+        "n_bestofn_pass": bestofn_pass_n,
+        "mean_reward": mean_reward,
+        "pass_at_1": pass_at_1_rate,
+        "bestofn_pass_rate": bestofn_pass_rate,
+        "problems": per_problem,
+    }
+    append_jsonl(output_dir / "val_log.jsonl", summary)
+    return summary
 
 
 def save_checkpoint(model: Any, output_dir: Path, tag: str) -> None:
@@ -231,6 +556,66 @@ def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _indices_with_io(dataset: Any) -> List[int]:
+    """有 input_output 测例的题目 idx。"""
+    out: List[int] = []
+    n = len(dataset.df)
+    for idx in range(n):
+        try:
+            ins = dataset.get_io_inputs(idx, max_count=1)
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+            ins = []
+        if ins:
+            out.append(idx)
+    return out
+
+
+def load_or_build_val_indices(
+    dataset: Any,
+    output_dir: Path,
+    *,
+    val_size: int,
+    val_seed: int,
+    val_indices_file: str,
+) -> List[int]:
+    if val_size <= 0:
+        return []
+
+    path = Path(val_indices_file).expanduser() if val_indices_file else None
+    if path and path.is_file():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        indices = data.get("indices") if isinstance(data, dict) else data
+        if not isinstance(indices, list):
+            raise ValueError(f"无效的验证集文件: {path}")
+        return [int(i) for i in indices]
+
+    pool = _indices_with_io(dataset)
+    if len(pool) < val_size:
+        raise ValueError(
+            f"仅有 {len(pool)} 题含 input_output，少于 val_size={val_size}"
+        )
+    rng = random.Random(val_seed)
+    chosen = sorted(rng.sample(pool, val_size))
+
+    out_path = output_dir / "val_indices.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(
+            {
+                "dataset_size": len(dataset.df),
+                "pool_size": len(pool),
+                "val_size": val_size,
+                "seed": val_seed,
+                "indices": chosen,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return chosen
 
 
 def resolve_dataset_path(args: argparse.Namespace) -> str:
@@ -254,9 +639,29 @@ def train_loop(
     end = args.end if args.end is not None else len(dataset.df)
     global_step = 0
 
+    summary = logging.getLogger(TRAIN_SUMMARY_LOGGER)
+
+    val_indices = load_or_build_val_indices(
+        dataset,
+        output_dir,
+        val_size=args.val_size,
+        val_seed=args.val_seed,
+        val_indices_file=args.val_indices_file,
+    )
+    val_set: Set[int] = set(val_indices)
+    train_indices = [i for i in range(args.start, end) if i not in val_set]
+    if val_set:
+        summary.info(
+            "val_init n=%d train_n=%d val_indices=%s",
+            len(val_indices),
+            len(train_indices),
+            str(output_dir / "val_indices.json"),
+        )
+
     for epoch in range(args.epochs):
-        logging.info("epoch %d/%d", epoch + 1, args.epochs)
-        for idx in range(args.start, end):
+        if args.debug:
+            logging.info("epoch %d/%d", epoch + 1, args.epochs)
+        for idx in train_indices:
             question = dataset.get_by_tag("description", idx)
             problem_id = dataset.get_by_tag("id", idx)
 
@@ -264,6 +669,7 @@ def train_loop(
                 model,
                 trainer,
                 question,
+                idx=idx,
                 naive_bestofn=args.naive_bestofn,
                 solver_bestofn=args.solver_bestofn,
                 input_count=args.input_count,
@@ -282,15 +688,16 @@ def train_loop(
             append_jsonl(log_path, record)
 
             if stats.get("skipped"):
-                logging.info(
-                    "step=%d idx=%d id=%s skipped (%s)",
-                    global_step,
-                    idx,
-                    problem_id,
-                    stats.get("reason"),
-                )
+                if args.debug:
+                    logging.info(
+                        "step=%d idx=%d id=%s skipped (%s)",
+                        global_step,
+                        idx,
+                        problem_id,
+                        stats.get("reason"),
+                    )
             else:
-                logging.info(
+                summary.info(
                     "step=%d idx=%d id=%s rewards=%s losses=%s updated=%d",
                     global_step,
                     idx,
@@ -303,40 +710,108 @@ def train_loop(
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(model, output_dir, f"step_{global_step}")
 
+            if (
+                val_indices
+                and args.val_every > 0
+                and global_step % args.val_every == 0
+            ):
+                val_stats = run_validation(
+                    model,
+                    trainer,
+                    dataset,
+                    val_indices,
+                    global_step=global_step,
+                    args=args,
+                    output_dir=output_dir,
+                )
+                summary.info(
+                    "val step=%d n=%d ok=%d skip=%d pass@1=%.4f (%d/%d) "
+                    "bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+                    global_step,
+                    val_stats.get("n_val", 0),
+                    val_stats.get("n_ok", 0),
+                    val_stats.get("n_skip", 0),
+                    float(val_stats.get("pass_at_1", 0.0)),
+                    val_stats.get("n_pass_at_1", 0),
+                    val_stats.get("n_ok", 0),
+                    float(val_stats.get("bestofn_pass_rate", 0.0)),
+                    val_stats.get("n_bestofn_pass", 0),
+                    val_stats.get("n_ok", 0),
+                    float(val_stats.get("mean_reward", 0.0)),
+                )
+
     save_checkpoint(model, output_dir, "final")
-    logging.info("训练完成，日志: %s", log_path)
+    if val_indices and args.val_every > 0:
+        val_stats = run_validation(
+            model,
+            trainer,
+            dataset,
+            val_indices,
+            global_step=global_step,
+            args=args,
+            output_dir=output_dir,
+        )
+        summary.info(
+            "val step=%d (final) n=%d ok=%d skip=%d pass@1=%.4f (%d/%d) "
+            "bestofn_pass=%.4f (%d/%d) mean_reward=%.4f",
+            global_step,
+            val_stats.get("n_val", 0),
+            val_stats.get("n_ok", 0),
+            val_stats.get("n_skip", 0),
+            float(val_stats.get("pass_at_1", 0.0)),
+            val_stats.get("n_pass_at_1", 0),
+            val_stats.get("n_ok", 0),
+            float(val_stats.get("bestofn_pass_rate", 0.0)),
+            val_stats.get("n_bestofn_pass", 0),
+            val_stats.get("n_ok", 0),
+            float(val_stats.get("mean_reward", 0.0)),
+        )
+    if args.debug:
+        logging.info("训练完成，日志: %s", log_path)
 
 
 def main() -> None:
     args = parse_args()
-    setup_logging(args.log_file)
+    setup_logging(args.log_file, debug=args.debug)
 
-    devices = tuple(d.strip() for d in args.devices.split(","))
-    if len(devices) != 3:
-        raise ValueError("--devices 需要 3 个设备，例如 cuda:0,cuda:1,cuda:2")
-    validate_devices(devices)
+    devices = parse_devices_arg(args.devices, args.chat_backend)
+    validate_devices(devices, args.chat_backend)
+
+    vllm_tp = args.vllm_tp_size
+    if args.chat_backend == "vllm":
+        vllm_tp = validate_vllm_layout(devices, args.vllm_tp_size)
 
     dataset_path = resolve_dataset_path(args)
     dataset = load_dataset(args.dataset, dataset_path)
-    logging.info(
-        "数据集加载完成 [%s] path=%s 共 %d 题",
-        args.dataset,
-        dataset_path,
-        len(dataset.df),
-    )
 
-    logging.info(
-        "训练模式: %s",
-        "LoRA (仅 solver)" if args.use_lora else "全参数 (仅 solver，显存需求大)",
-    )
-
-    exec_kwargs = _exec_kwargs(args)
-    logging.info(
-        "代码执行: timeout=%ss inject_mode=%s backoff=%s",
-        exec_kwargs["timeout"],
-        exec_kwargs["inject_mode"],
-        exec_kwargs["inject_backoff"],
-    )
+    if args.debug:
+        logging.info(
+            "数据集加载完成 [%s] path=%s 共 %d 题",
+            args.dataset,
+            dataset_path,
+            len(dataset.df),
+        )
+        logging.info(
+            "训练模式: %s",
+            "LoRA (仅 solver)" if args.use_lora else "全参数 (仅 solver，显存需求大)",
+        )
+        exec_kwargs = _exec_kwargs(args)
+        logging.info(
+            "代码执行: timeout=%ss inject_mode=%s backoff=%s workers=%s",
+            exec_kwargs["timeout"],
+            exec_kwargs["inject_mode"],
+            exec_kwargs["inject_backoff"],
+            exec_kwargs["exec_workers"],
+        )
+        logging.info(
+            "chat: backend=%s vllm_tp=%s max_new_tokens=%s input_source=%s",
+            args.chat_backend,
+            vllm_tp,
+            args.max_new_tokens,
+            args.input_source,
+        )
+    else:
+        exec_kwargs = _exec_kwargs(args)
 
     model = Model(
         dataset,
@@ -349,6 +824,12 @@ def main() -> None:
         lora_dropout=args.lora_dropout,
         gradient_checkpointing=args.gradient_checkpointing,
         exec_kwargs=exec_kwargs,
+        chat_backend=args.chat_backend,
+        vllm_tp_size=vllm_tp,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        input_source=args.input_source,
     )
     trainer = MultiTrainer()
     train_loop(model, dataset, trainer, args)

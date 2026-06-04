@@ -8,8 +8,11 @@ APPS 数据集（目录结构同 get_codeforces_data/APPS/train）。
 """
 from __future__ import annotations
 
+import json
 import re
+import sys
 from pathlib import Path
+from typing import Any, List, Optional
 
 import pandas as pd
 from tqdm import tqdm
@@ -59,6 +62,67 @@ def extract_pure_problem(text: str) -> str:
         pure_lines.pop()
 
     return "\n".join(pure_lines).strip("\n")
+
+
+def _loads_input_output_json(text: str) -> Optional[Any]:
+    """
+    解析 input_output.json。
+    APPS 中偶发超大整数测例，需放宽 Python 3.11+ 的 int 字符串长度限制。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    old_limit = None
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    if callable(setter) and callable(getter):
+        old_limit = getter()
+        setter(0)
+
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        if old_limit is not None and callable(setter):
+            setter(old_limit)
+
+
+def parse_input_output_inputs(text: str) -> List[str]:
+    """解析 APPS input_output.json，返回 inputs 列表（每项为一条测例 stdin）。"""
+    data = _loads_input_output_json(text)
+    if not isinstance(data, dict):
+        return []
+
+    raw = data.get("inputs")
+    if not isinstance(raw, list):
+        return []
+
+    out: List[str] = []
+    for item in raw:
+        s = str(item)
+        if s.strip():
+            out.append(s)
+    return out
+
+
+def parse_input_output_outputs(text: str) -> List[str]:
+    """解析 APPS input_output.json，返回 outputs 列表（每项为一条测例期望 stdout）。"""
+    data = _loads_input_output_json(text)
+    if not isinstance(data, dict):
+        return []
+
+    raw = data.get("outputs")
+    if not isinstance(raw, list):
+        return []
+
+    out: List[str] = []
+    for item in raw:
+        s = str(item)
+        if s.strip():
+            out.append(s)
+    return out
 
 
 class APPS:
@@ -141,6 +205,30 @@ class APPS:
 
     def problem_dir(self, idx) -> Path:
         return Path(self.get_by_tag("dir", idx))
+
+    def get_io_inputs(self, idx, max_count: int = 10) -> List[str]:
+        """读取题目目录下 input_output.json 的 inputs 字段。"""
+        prob_dir = self.problem_dir(idx)
+        io_path = prob_dir / "input_output.json"
+        if not io_path.exists():
+            return []
+        text = _read_text(io_path)
+        inputs = parse_input_output_inputs(text)
+        if max_count > 0:
+            return inputs[:max_count]
+        return inputs
+
+    def get_io_outputs(self, idx, max_count: int = 10) -> List[str]:
+        """读取题目目录下 input_output.json 的 outputs 字段。"""
+        prob_dir = self.problem_dir(idx)
+        io_path = prob_dir / "input_output.json"
+        if not io_path.exists():
+            return []
+        text = _read_text(io_path)
+        outputs = parse_input_output_outputs(text)
+        if max_count > 0:
+            return outputs[:max_count]
+        return outputs
 
     def foreach(self, func, start=0, end=None):
         if end is None:
