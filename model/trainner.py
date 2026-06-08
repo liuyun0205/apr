@@ -283,10 +283,16 @@ class MultiTrainer:
             workers,
         )
 
-    def calc_solver_rewards(self, all_matrices):
+    def calc_solver_rewards(self, all_matrices, solver_pass_flags, naive_pass_flags, beta=0.3):
         """
-        all_matrices[input_idx][solver_idx][naive_idx]，格为 1/0。
-        执行失败或超时在矩阵里记 0。
+        all_matrices[input_idx][solver_idx][naive_idx]
+            solver 和 naive 是否一致，1/0
+
+        solver_pass_flags[input_idx][solver_idx]
+            solver 是否通过题干样例，1/0
+
+        naive_pass_flags[input_idx][naive_idx]
+            naive 是否通过题干样例，1/0
         """
 
         if not all_matrices:
@@ -297,19 +303,128 @@ class MultiTrainer:
         if num_solvers == 0:
             return []
 
+        num_naives = len(all_matrices[0][0])
+        if num_naives == 0:
+            return []
+
         rewards = [0.0] * num_solvers
 
-        for matrix in all_matrices:
+        for input_idx, matrix in enumerate(all_matrices):
+            # w_j：当前 input 上 naive 集体可信度
+            w_j = sum(naive_pass_flags[input_idx]) / num_naives
+            confidence = 2.0 * w_j - 1.0
+
             row_sums = [sum(row) for row in matrix]
             max_sum = max(row_sums)
 
-            if max_sum == 0:
-                input_rewards = [0.0] * num_solvers
-            else:
-                input_rewards = [row_sum / max_sum for row_sum in row_sums]
-
             for solver_idx in range(num_solvers):
-                rewards[solver_idx] += input_rewards[solver_idx]
+                # S_{i,j}：solver 被 naive 支持的归一化分数
+                if max_sum == 0:
+                    S_ij = 0.0
+                else:
+                    S_ij = row_sums[solver_idx] / max_sum
+
+                # A_{i,j}：solver 是否通过题干样例
+                A_ij = solver_pass_flags[input_idx][solver_idx]
+
+                reward = S_ij + beta * confidence * A_ij
+
+                rewards[solver_idx] += reward
 
         return [r / num_inputs for r in rewards]
 
+    def calc_solver_rewards(self, all_matrices, solver_pass_flags, naive_pass_flags, beta=0.3):
+        """
+        all_matrices[input_idx][solver_idx][naive_idx]
+            solver 和 naive 是否一致，1/0
+
+        solver_pass_flags[input_idx][solver_idx]
+            solver 是否通过题干样例，1/0
+
+        naive_pass_flags[input_idx][naive_idx]
+            naive 是否通过题干样例，1/0
+        """
+
+        if not all_matrices:
+            return []
+
+        num_inputs = len(all_matrices)
+        num_solvers = len(all_matrices[0])
+        if num_solvers == 0:
+            return []
+
+        num_naives = len(all_matrices[0][0])
+        if num_naives == 0:
+            return []
+
+        rewards = [0.0] * num_solvers
+
+        for input_idx, matrix in enumerate(all_matrices):
+            # w_j：当前 input 上 naive 集体可信度
+            w_j = sum(naive_pass_flags[input_idx]) / num_naives
+            confidence = 2.0 * w_j - 1.0
+
+            row_sums = [sum(row) for row in matrix]
+            max_sum = max(row_sums)
+
+            for solver_idx in range(num_solvers):
+                # S_{i,j}：solver 被 naive 支持的归一化分数
+                if max_sum == 0:
+                    S_ij = 0.0
+                else:
+                    S_ij = row_sums[solver_idx] / max_sum
+
+                # A_{i,j}：solver 是否通过题干样例
+                A_ij = solver_pass_flags[input_idx][solver_idx]
+
+                reward = S_ij + beta * confidence * A_ij
+
+                rewards[solver_idx] += reward
+
+        return [r / num_inputs for r in rewards]
+
+    def calc_naive_rewards(self, all_matrices, naive_pass_flags):
+        """
+        all_matrices[input_idx][solver_idx][naive_idx]
+
+        naive_pass_flags[input_idx][naive_idx]
+            naive 是否通过题干样例
+        """
+
+        if not all_matrices:
+            return []
+
+        num_inputs = len(all_matrices)
+        num_solvers = len(all_matrices[0])
+        num_naives = len(all_matrices[0][0])
+
+        rewards = [0.0] * num_naives
+
+        for input_idx, matrix in enumerate(all_matrices):
+
+            # w_j
+            w_j = (
+                    sum(naive_pass_flags[input_idx])
+                    / num_naives
+            )
+
+            confidence = 2.0 * w_j - 1.0
+
+            for naive_idx in range(num_naives):
+                # N_{k,j}
+                N_kj = naive_pass_flags[input_idx][naive_idx]
+
+                # C_{k,j}
+                support_count = sum(
+                    matrix[solver_idx][naive_idx]
+                    for solver_idx in range(num_solvers)
+                )
+
+                C_kj = support_count / num_solvers
+
+                reward = confidence * N_kj * C_kj
+
+                rewards[naive_idx] += reward
+
+        return [r / num_inputs for r in rewards]
+    
