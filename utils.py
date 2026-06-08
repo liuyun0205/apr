@@ -252,6 +252,48 @@ def run_solve(code: str, input_str: str, timeout=10, **kwargs):
     return run_code(code, input_str=input_str, timeout=timeout, **kwargs)
 
 
+def run_solve_plain(code: str, input_str: str, timeout: int = 10) -> tuple:
+    """纯子进程执行：stdin 喂入测例，无注入退避、无重试。"""
+    code = clean_code(code)
+    if not code.strip():
+        return "", "empty code"
+
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            delete=False,
+            encoding="utf-8",
+        ) as f:
+            f.write(code)
+            path = f.name
+
+        run_res = subprocess.run(
+            [sys.executable, path],
+            input=input_str,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        stderr = (run_res.stderr or "").strip()
+        stdout = (run_res.stdout or "").strip()
+        if run_res.returncode != 0:
+            return stdout, stderr or f"exit_{run_res.returncode}"
+        return stdout, ""
+    except subprocess.TimeoutExpired:
+        return "", "timeout"
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def run_solve_ok(stderr: str) -> bool:
     """子进程是否正常结束（非超时、非 exit 报错、非空代码）。"""
     return (stderr or "") == ""

@@ -1,30 +1,39 @@
-Given a competitive programming / algorithmic problem statement, you must output ONLY a single complete Python 3 script.
+You are a competitive programming code generator.
+I will give you a complete problem statement.
+Your task is to output ONLY Python code — no explanations, no markdown, no comments, no text outside the code.
 
-1) Output MUST be ONLY the Python script.
+The script must contain a CORRECT brute-force solver for the problem.
+
+Requirements:
+1. Must use enumeration / BFS / DFS / backtracking / simulation.
+2. NO formulas, NO shortcuts, NO advanced optimizations.
+3. The solver must read the complete input from stdin.
+4. The solver must print the correct output to stdout.
+5. The code must be pure runnable Python 3.
 
 Required code structure:
 
 import sys
 
 def solve(input_str: str) -> str:
+    data = input_str.split()
     ...
     return answer
 
 def main():
     input_str = sys.stdin.read()
-    output = solve(input_str)
-    print(output)
+    print(solve(input_str))
 
 if __name__ == "__main__":
     main()
 
 Rules:
-- solve(input_str) must receive external input as a string.
-- solve(input_str) must return the final output string.
-- main() must read from stdin and print solve(input_str).
-- Do NOT include gen_random_input.
-- Do NOT include solve_bruteforce unless explicitly required.
-- Do NOT write explanations, markdown, or comments.
+- Do NOT generate random inputs.
+- Do NOT output JSON / JSONL.
+- Do NOT write any explanation.
+- Do NOT add any extra print.
+- Do NOT add markdown formatting.
+- Output MUST be ONLY the Python script.
 
 I will now provide the full problem statement.
 Only output the Python script implementing this.

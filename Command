@@ -76,7 +76,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
   --naive_bestofn 3 \
   --solver_bestofn 3 \
   --input_count 10 \
-  --input_source input_output \
+  --input_source auto \
   --start 0 --end 5000 \
   --epochs 1 \
   --save_every 50 \
@@ -84,6 +84,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
   --val_every 25 \
   --val_seed 42
 
+# 测例：auto=有官方 input_output 用 GT，否则 input_trigger（vLLM）生成
 # 验证集：启动时从 APPS 抽 300 题（有 input_output）→ output_dir/val_indices.json
 # 验证：开局 update_step=0 基线；之后每 25 次真正 update 验证一次
 
@@ -105,3 +106,82 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
 # 单独起 vLLM API 服务（评测/脚本用，非 train.py 必需）：
 # CUDA_VISIBLE_DEVICES=0 vllm serve ~/lzh/Qwen2.5-Coder-7B-Instruct \
 #   --port 8000 --served-model-name Qwen2.5-Coder-7B-Instruct
+
+# ---------- APPS/test pass@1（两个 tmux 前台跑，无注入退避）----------
+# 流程：生成1份代码 → APPS/test 官方 input 跑 → 对官方 output，全过=pass@1
+cd ~/lzh/apr
+
+# 若旧 bash 脚本还占卡，先清理：
+python model/kill_pass1_gpu.py
+# 或手动：kill 4055693 4055698   # 换成 ps/nvidia-smi 里看到的 PID
+
+# tmux 窗口1（卡5，Qwen2.5-Coder naive+solver）
+python model/run_pass1_gpu5_qwen25.py
+
+# tmux 窗口2（卡6，Qwen3-8b naive+solver）
+python model/run_pass1_gpu6_qwen3.py
+
+# 汇总: outputs/pass1_eval/*_summary.json
+
+# ---------- LoRA only_solver pass@1（先合并，再 vLLM）----------
+# 1) 仅合并（约 5-10 分钟，额外 ~15GB → outputs/only_solver/merged_model）
+python model/merge_lora.py \
+  --gpu 7 \
+  --base-model ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --lora ~/lzh/apr/outputs/only_solver/final \
+  --output ~/lzh/apr/outputs/only_solver/merged_model
+
+# 2) 合并 + vLLM 评测（无合并产物时自动 merge）
+python model/run_pass1_only_solver_merged.py
+
+# 结果: outputs/pass1_eval/merged_model_solver.jsonl
+# 慢速回退（HF+PEFT）: python model/eval_pass1_lora.py ...
+
+# ---------- 逐题推理（推理链 + naive/solver 代码 → <题号>/apr/infer_reasoning.jsonl）----------
+# 挂物理卡 5：
+python model/infer_reasoning.py \
+  --gpu 5 \
+  --dataset apps \
+  --dataset_path ~/lzh/datasets/APPS/train \
+  --model ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --model-type local \
+  --tensor-parallel-size 1 \
+  --start 0 --end 5000 \
+  --roles naive,solver \
+  --resume
+
+# CodeContests 预解压（训练/验证前跑一次，避免每题解 tar）
+# cd ~/datasets/codecontests   # 服务器路径按实际改
+# python extract_parquet_tasks.py tasks.parquet ./extracted_tasks
+# 9644 题，约 1～2 分钟（本地 SSD）
+
+# CodeContests 全量训练（物理卡 3,4,5,6：vLLM tp=2 占 cuda:0,1，solver 训 cuda:2）
+CUDA_VISIBLE_DEVICES=1,2,3 python model/train.py \
+  --dataset apps \
+  --dataset_path ~/lzh/datasets/APPS/train\
+  --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --chat_backend vllm \
+  --vllm_tp_size 2 \
+  --devices cuda:2 \
+  --use_lora \
+  --gradient_checkpointing \
+  --inject_mode half \
+  --inject_value 10 \
+  --exec_timeout 10 \
+  --exec_workers 40 \
+  --output_dir outputs/solver_rl_apps \
+  --naive_bestofn 16 \
+  --solver_bestofn 16 \
+  --input_count 10 \
+  --input_source auto \
+  --start 0 --end 9644 \
+  --epochs 1 \
+  --save_every 500 \
+  --val_size 100 \
+  --val_every 500 \
+  --val_seed 42
+
+# CodeContests 全量 pass@1（物理卡 3,4,5,6，vLLM tp=4）
+# python model/kill_pass1_gpu.py   # 若旧进程占卡先清理
+# python model/run_pass1_codecontests_gpu3456.py
+# 结果: outputs/pass1_eval_codecontests/*_summary.json

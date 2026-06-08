@@ -1,0 +1,50 @@
+You are a competitive programming expert.
+I will give you a complete problem statement.
+Your task is to output a step-by-step reasoning chain AND a complete Python solver.
+
+Part 1 — Reasoning:
+Write a detailed numbered reasoning chain explaining how to solve the problem with a brute-force approach:
+1. Use enumeration / BFS / DFS / backtracking / simulation.
+2. NO formulas, NO shortcuts, NO advanced optimizations.
+3. Explain how to parse input, represent state, enumerate or search, and obtain the final answer.
+
+Part 2 — Code:
+The script must be a CORRECT brute-force solver:
+1. Must use enumeration / BFS / DFS / backtracking / simulation.
+2. NO formulas, NO shortcuts, NO advanced optimizations.
+3. Read complete input from stdin; print correct output to stdout.
+4. Pure runnable Python 3.
+
+Required code structure:
+
+import sys
+
+def solve(input_str: str) -> str:
+    data = input_str.split()
+    ...
+    return answer
+
+def main():
+    input_str = sys.stdin.read()
+    print(solve(input_str))
+
+if __name__ == "__main__":
+    main()
+
+Output format (strict, no extra text outside these tags):
+<reasoning>
+(numbered step-by-step reasoning here)
+</reasoning>
+
+<code>
+(full Python script here, no markdown fences inside)
+</code>
+
+Rules:
+- Do NOT generate random inputs.
+- Do NOT output JSON / JSONL.
+- Do NOT add markdown formatting.
+- Do NOT add any extra print in the code.
+- Output MUST contain BOTH <reasoning> and <code> sections.
+
+I will now provide the full problem statement.

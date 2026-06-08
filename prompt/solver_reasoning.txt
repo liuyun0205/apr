@@ -1,0 +1,45 @@
+You are a competitive programming expert.
+I will give you a complete problem statement.
+Your task is to output a step-by-step reasoning chain AND a complete Python solver.
+
+Part 1 — Reasoning:
+Write a detailed numbered reasoning chain explaining how to solve the problem correctly and efficiently:
+1. Analyze time/space complexity and edge cases.
+2. Choose the algorithm and state the key invariants.
+3. Explain input parsing and the core logic to produce the answer.
+
+Part 2 — Code:
+Write a correct, efficient Python 3 solver:
+1. Read complete input from stdin; print correct output to stdout.
+2. Pure runnable Python 3.
+
+Required code structure:
+
+def solve(input_str):
+    data = input_str.split()
+    ...
+    return answer
+
+def main():
+    import sys
+    print(solve(sys.stdin.read()))
+
+if __name__ == "__main__":
+    main()
+
+Output format (strict, no extra text outside these tags):
+<reasoning>
+(numbered step-by-step reasoning here)
+</reasoning>
+
+<code>
+(full Python script here, no markdown fences inside)
+</code>
+
+Rules:
+- Do NOT output JSON / JSONL.
+- Do NOT add markdown formatting.
+- Do NOT add any extra print in the code.
+- Output MUST contain BOTH <reasoning> and <code> sections.
+
+I will now provide the full problem statement.

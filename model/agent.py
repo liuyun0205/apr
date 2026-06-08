@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -26,29 +27,34 @@ class Agent:
         *,
         use_lora: bool = False,
         trainable: bool = False,
-        lora_r: int = 8,
-        lora_alpha: int = 16,
+        lora_r: int = 64,
+        lora_alpha: int = 128,
         lora_dropout: float = 0.05,
         lora_target_modules=None,
         gradient_checkpointing: bool = False,
+        lora_path: str = "",
     ):
         self.device = device
         self.system_prompt = system_prompt
         self.use_lora = use_lora
         self.trainable = trainable
+        self.lora_path = (lora_path or "").strip()
 
+        base_path = model_path
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
+            base_path,
             trust_remote_code=True,
         )
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            base_path,
             trust_remote_code=True,
             dtype=torch.bfloat16,
         ).to(device)
 
-        if use_lora:
+        if self.lora_path:
+            self._load_lora_adapter(self.lora_path)
+        elif use_lora:
             self._apply_lora(
                 r=lora_r,
                 alpha=lora_alpha,
@@ -79,6 +85,23 @@ class Agent:
                 f"{n_total:,}",
                 100.0 * n_trainable / max(n_total, 1),
             )
+
+    def _load_lora_adapter(self, lora_path: str) -> None:
+        try:
+            from peft import PeftModel
+        except ImportError as e:
+            raise ImportError(
+                "加载 LoRA 需要安装 peft: pip install peft"
+            ) from e
+
+        adapter = str(Path(lora_path).expanduser())
+        if not (Path(adapter) / "adapter_config.json").exists():
+            raise FileNotFoundError(
+                f"LoRA 目录缺少 adapter_config.json: {adapter}"
+            )
+        self.model = PeftModel.from_pretrained(self.model, adapter)
+        self.model.eval()
+        logging.info("已加载 LoRA adapter: %s", adapter)
 
     def _apply_lora(self, *, r, alpha, dropout, target_modules):
         try:
@@ -133,13 +156,17 @@ class Agent:
             return_tensors="pt",
         ).to(self.device)
 
-        outputs = self.model.generate(
-            **inputs,
+        gen_kw = dict(
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
             pad_token_id=self.tokenizer.eos_token_id,
         )
+        if temperature is None or temperature <= 0:
+            gen_kw["do_sample"] = False
+        else:
+            gen_kw["do_sample"] = True
+            gen_kw["temperature"] = float(temperature)
+
+        outputs = self.model.generate(**inputs, **gen_kw)
 
         answer = self.tokenizer.decode(
             outputs[0][inputs.input_ids.shape[1]:],

@@ -10,6 +10,7 @@ def load_dataset(dataset: str, path: str):
     dataset:
       - codecontestplus / ccp
       - apps
+      - codecontests / cc
     """
     name = (dataset or "codecontestplus").strip().lower()
     p = str(Path(path).expanduser())
@@ -24,6 +25,11 @@ def load_dataset(dataset: str, path: str):
 
         return APPS(p)
 
+    if name in ("codecontests", "cc", "code_contests"):
+        from alldatasets.codecontests import CodeContests
+
+        return CodeContests(p)
+
     raise ValueError(
-        f"未知 dataset={dataset!r}，可选: codecontestplus, apps"
+        f"未知 dataset={dataset!r}，可选: codecontestplus, apps, codecontests"
     )

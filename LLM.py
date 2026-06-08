@@ -116,6 +116,8 @@ class LLMConfig:
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
     max_model_len: Optional[int] = None
+    enable_lora: bool = False
+    max_lora_rank: int = 64
 
     use_zero: bool = False
     zero_stage: int = 3
@@ -171,6 +173,10 @@ class LLM:
         }
         if self.config.max_model_len is not None:
             vllm_kwargs["max_model_len"] = int(self.config.max_model_len)
+        if self.config.enable_lora:
+            vllm_kwargs["enable_lora"] = True
+            vllm_kwargs["max_loras"] = 1
+            vllm_kwargs["max_lora_rank"] = max(1, int(self.config.max_lora_rank))
 
         self._model = VLLMEngine(**vllm_kwargs)
         self._tokenizer = self._model.get_tokenizer()
@@ -194,13 +200,22 @@ class LLM:
         user_contents: List[str],
         *,
         system_prompt: Optional[str] = None,
+        lora_path: Optional[str] = None,
+        lora_int_id: int = 1,
+        lora_name: str = "solver",
     ) -> List[str]:
         if not user_contents:
             return []
         sys_prompt = self.config.system_prompt if system_prompt is None else system_prompt
 
         if self._backend == "local":
-            return self._chat_batch_local(user_contents, sys_prompt)
+            return self._chat_batch_local(
+                user_contents,
+                sys_prompt,
+                lora_path=lora_path,
+                lora_int_id=lora_int_id,
+                lora_name=lora_name,
+            )
         return [self._chat_api(u, sys_prompt) for u in user_contents]
 
     def _build_messages(self, user_content: str, system_prompt: str) -> List[Dict[str, str]]:
@@ -248,21 +263,59 @@ class LLM:
     def _chat_local(self, user_content: str, system_prompt: str) -> str:
         return self._chat_batch_local([user_content], system_prompt)[0]
 
-    def _vllm_generate_batch(self, prompts: List[str], sampling: Any) -> List[Any]:
+    def _vllm_generate_batch(
+        self,
+        prompts: List[str],
+        sampling: Any,
+        *,
+        lora_request: Any = None,
+    ) -> List[Any]:
         """批量 generate，并尽量关闭 tqdm。"""
+        gen_kw: Dict[str, Any] = dict(
+            sampling_params=sampling,
+            use_tqdm=False,
+        )
+        if lora_request is not None:
+            gen_kw["lora_request"] = lora_request
         try:
-            return self._model.generate(
-                prompts,
-                sampling_params=sampling,
-                use_tqdm=False,
-            )
+            return self._model.generate(prompts, **gen_kw)
         except TypeError:
-            return self._model.generate(prompts, sampling_params=sampling)
+            gen_kw.pop("use_tqdm", None)
+            return self._model.generate(prompts, **gen_kw)
+
+    def _build_lora_request(
+        self,
+        *,
+        lora_path: Optional[str],
+        lora_int_id: int,
+        lora_name: str,
+    ) -> Any:
+        if not lora_path:
+            return None
+        if not self.config.enable_lora:
+            raise RuntimeError(
+                "vLLM 未启用 LoRA（enable_lora=False），无法加载 adapter。"
+                "训练时请传 --use_lora。"
+            )
+        from vllm.lora.request import LoRARequest  # type: ignore
+
+        path = str(lora_path).strip()
+        if not path:
+            return None
+        return LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=max(1, int(lora_int_id)),
+            lora_path=path,
+        )
 
     def _chat_batch_local(
         self,
         user_contents: List[str],
         system_prompt: str,
+        *,
+        lora_path: Optional[str] = None,
+        lora_int_id: int = 1,
+        lora_name: str = "solver",
     ) -> List[str]:
         assert self._model is not None
 
@@ -273,7 +326,16 @@ class LLM:
         prompts = [
             self._encode_messages_for_local(m) for m in messages_list
         ]
-        outputs = self._vllm_generate_batch(prompts, sampling)
+        lora_request = self._build_lora_request(
+            lora_path=lora_path,
+            lora_int_id=lora_int_id,
+            lora_name=lora_name,
+        )
+        outputs = self._vllm_generate_batch(
+            prompts,
+            sampling,
+            lora_request=lora_request,
+        )
         return [self._vllm_output_text([o]) for o in outputs]
 
     def _chat_api(self, user_content: str, system_prompt: str) -> str:
@@ -334,3 +396,32 @@ class LLM:
             raise err
         data = r.json()
         return data["choices"][0]["message"]["content"]
+
+    def release(self) -> None:
+        """释放 vLLM / 本地模型占用的 GPU 显存。"""
+        import gc
+
+        if self._backend == "local" and self._model is not None:
+            engine = self._model
+            self._model = None
+            self._tokenizer = None
+            self._sampling_params_cls = None
+            del engine
+            try:
+                from vllm.distributed.parallel_state import (  # type: ignore
+                    destroy_model_parallel,
+                )
+
+                destroy_model_parallel()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass

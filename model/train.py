@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="codecontestplus",
-        choices=["codecontestplus", "apps"],
+        choices=["codecontestplus", "apps", "codecontests"],
         help="训练数据集类型",
     )
     parser.add_argument(
@@ -123,8 +123,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅对 solver 启用 LoRA 训练（推荐，显存占用更小）",
     )
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument(
         "--gradient_checkpointing",
@@ -340,56 +340,77 @@ def one_step(
     question: str,
     *,
     idx: int,
+    global_step: int = 0,
     naive_bestofn: int,
     solver_bestofn: int,
     input_count: int,
     min_reward: float,
     exec_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """单题训练一步：采样 -> 打分 -> 更新 solver。"""
-    candidates = model.generate_candidates(
-        naive_bestofn,
-        solver_bestofn,
-        question,
-        input_count=input_count,
-        idx=idx,
-    )
-    inputs = candidates.get("inputs") or []
-    if not inputs:
-        return {"skipped": True, "reason": "no_inputs"}
-
-    matrices = trainer.build_matrices(candidates, exec_kwargs=exec_kwargs or {})
-    if not matrices or not matrices[0]:
-        return {"skipped": True, "reason": "empty_matrices"}
-
-    rewards = trainer.calc_solver_rewards(matrices)
-    prompt = model.solver.build_prompt(question)
-
-    losses: List[float] = []
-    updated = 0
-    for code, reward in zip(candidates["solver_codes"], rewards):
-        if reward <= min_reward:
-            continue
-        code = utils.clean_code(code)
-        if not code.strip():
-            continue
-        loss = trainer.update_agent(
-            model.solver,
-            prompt,
-            code,
-            reward,
+    """单题训练一步：rollout（vLLM+LoRA / HF+LoRA）-> 打分 -> HF 更新 LoRA。"""
+    lora_synced = False
+    cache = getattr(model, "rollout_lora_cache_dir", None)
+    if (
+        cache
+        and getattr(model, "chat_backend", "") == "vllm"
+        and getattr(model, "_use_lora", False)
+    ):
+        model.sync_solver_lora_for_vllm(
+            cache,
+            lora_int_id=max(1, int(global_step)),
         )
-        losses.append(loss)
-        updated += 1
+        lora_synced = True
 
-    return {
-        "skipped": False,
-        "num_inputs": len(inputs),
-        "input_source": candidates.get("input_source"),
-        "rewards": rewards,
-        "losses": losses,
-        "updated": updated,
-    }
+    try:
+        candidates = model.generate_candidates(
+            naive_bestofn,
+            solver_bestofn,
+            question,
+            input_count=input_count,
+            idx=idx,
+            use_trainable_solver=True,
+        )
+        solver_gen = model.ensure_solver_not_base(context="训练 rollout")
+        inputs = candidates.get("inputs") or []
+        if not inputs:
+            return {"skipped": True, "reason": "no_inputs"}
+
+        matrices = trainer.build_matrices(candidates, exec_kwargs=exec_kwargs or {})
+        if not matrices or not matrices[0]:
+            return {"skipped": True, "reason": "empty_matrices"}
+
+        rewards = trainer.calc_solver_rewards(matrices)
+        prompt = model.solver.build_prompt(question)
+
+        losses: List[float] = []
+        updated = 0
+        for code, reward in zip(candidates["solver_codes"], rewards):
+            if reward <= min_reward:
+                continue
+            code = utils.clean_code(code)
+            if not code.strip():
+                continue
+            loss = trainer.update_agent(
+                model.solver,
+                prompt,
+                code,
+                reward,
+            )
+            losses.append(loss)
+            updated += 1
+
+        return {
+            "skipped": False,
+            "num_inputs": len(inputs),
+            "input_source": candidates.get("input_source"),
+            "solver_gen_backend": solver_gen,
+            "rewards": rewards,
+            "losses": losses,
+            "updated": updated,
+        }
+    finally:
+        if lora_synced:
+            model.clear_solver_lora_snapshot()
 
 
 def eval_one(
@@ -403,14 +424,16 @@ def eval_one(
     input_count: int,
     exec_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """单题验证：只打分，不更新参数。"""
+    """单题验证：只打分，不更新参数；solver 用 LoRA（验证时 vLLM+LoRA 快照）。"""
     candidates = model.generate_candidates(
         naive_bestofn,
         solver_bestofn,
         question,
         input_count=input_count,
         idx=idx,
+        use_trainable_solver=True,
     )
+    solver_gen = model.ensure_solver_not_base(context="验证")
     inputs = candidates.get("inputs") or []
     if not inputs:
         return {"skipped": True, "reason": "no_inputs", "mean_reward": 0.0}
@@ -437,7 +460,10 @@ def eval_one(
 
     pass_at_1 = False
     if exp_slice and len(exp_slice) >= len(inputs):
-        fresh_codes = model.generate_solver_codes(question, n=1)
+        fresh_codes = model.generate_solver_codes(
+            question, n=1, use_trainable_solver=True
+        )
+        model.ensure_solver_not_base(context="验证 pass@1")
         if fresh_codes:
             pass_at_1 = utils.solver_passes_all_cases(
                 fresh_codes[0],
@@ -449,6 +475,7 @@ def eval_one(
     return {
         "skipped": False,
         "num_inputs": len(inputs),
+        "solver_gen_backend": solver_gen,
         "rewards": rewards,
         "mean_reward": mean_r,
         "max_reward": max(rewards) if rewards else 0.0,
@@ -478,12 +505,30 @@ def run_validation(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    """在固定验证集上评估当前 solver（无梯度）。"""
+    """在固定验证集上评估当前 solver（无梯度；vLLM+LoRA 或 HF LoRA 生成）。"""
     if not val_indices:
         return {"skipped": True, "reason": "no_val_indices"}
 
     was_training = model.solver.model.training
     model.solver.model.eval()
+
+    val_lora_dir = output_dir / "_val_lora_snapshot"
+    use_vllm_lora = (
+        getattr(model, "chat_backend", "") == "vllm"
+        and getattr(model, "_use_lora", False)
+    )
+    if use_vllm_lora:
+        model.sync_solver_lora_for_vllm(
+            str(val_lora_dir),
+            lora_int_id=max(1, int(update_step)),
+        )
+        logging.info(
+            "验证使用 vLLM+LoRA snapshot: %s (lora_int_id=%d)",
+            val_lora_dir,
+            update_step,
+        )
+    else:
+        model.clear_solver_lora_snapshot()
 
     input_count = args.val_input_count or args.input_count
     exec_kwargs = _exec_kwargs(args)
@@ -550,6 +595,7 @@ def run_validation(
     finally:
         if tqdm is not None and hasattr(iter_val, "close"):
             iter_val.close()
+        model.clear_solver_lora_snapshot()
         if was_training:
             model.solver.model.train()
 
@@ -651,6 +697,14 @@ def resolve_dataset_path(args: argparse.Namespace) -> str:
         return args.dataset_path
     if args.dataset == "apps":
         return "~/get_codeforces_data/APPS/train"
+    if args.dataset == "codecontests":
+        base = Path("~/datasets/codecontests").expanduser()
+        if args.dataset_path:
+            base = Path(args.dataset_path).expanduser()
+        extracted = base / "extracted_tasks"
+        if extracted.is_dir() and any(extracted.glob("code_contests-*")):
+            return str(extracted)
+        return str(base)
     return "~/lzh/datasets/codecontestplus"
 
 
@@ -663,6 +717,7 @@ def train_loop(
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "train_log.jsonl"
+    model.rollout_lora_cache_dir = str(output_dir / "_rollout_lora_snapshot")
 
     end = args.end if args.end is not None else len(dataset.df)
     global_step = 0
@@ -727,6 +782,7 @@ def train_loop(
                 trainer,
                 question,
                 idx=idx,
+                global_step=global_step,
                 naive_bestofn=args.naive_bestofn,
                 solver_bestofn=args.solver_bestofn,
                 input_count=args.input_count,
@@ -783,7 +839,7 @@ def train_loop(
                     trainer,
                     dataset,
                     val_indices,
-                    global_step=global_step,
+                    global_step=global_step, 
                     update_step=update_step,
                     args=args,
                     output_dir=output_dir,
@@ -843,8 +899,18 @@ def train_loop(
         logging.info("训练完成，日志: %s", log_path)
 
 
+def validate_train_lora_policy(args: argparse.Namespace) -> None:
+    """vLLM 训练必须用 LoRA，避免 solver rollout/验证误用冻结基座。"""
+    if args.chat_backend == "vllm" and not args.use_lora:
+        raise ValueError(
+            "chat_backend=vllm 时必须 --use_lora。"
+            "否则 vLLM 仅服务 naive/trigger，solver 若误走 vLLM 基座会原地踏步。"
+        )
+
+
 def main() -> None:
     args = parse_args()
+    validate_train_lora_policy(args)
     setup_logging(args.log_file, debug=args.debug)
 
     devices = parse_devices_arg(args.devices, args.chat_backend)
@@ -905,6 +971,17 @@ def main() -> None:
         input_source=args.input_source,
     )
     trainer = MultiTrainer()
+    summary = logging.getLogger(TRAIN_SUMMARY_LOGGER)
+    if args.chat_backend == "vllm":
+        summary.info(
+            "solver 路径: rollout/val=vLLM+LoRA快照 | update=HF LoRA | "
+            "vLLM基座仅 naive/trigger"
+        )
+    else:
+        summary.info(
+            "solver 路径: rollout/val/update 均 HF+%s",
+            "LoRA" if args.use_lora else "全参",
+        )
     train_loop(model, dataset, trainer, args)
 
 
