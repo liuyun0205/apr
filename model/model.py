@@ -63,8 +63,12 @@ class Model:
         self._lora_r = int(lora_r)
         self._solver_lora_path: Optional[str] = None
         self._solver_lora_int_id: int = 1
+        self._naive_lora_path: Optional[str] = None
+        self._naive_lora_int_id: int = 2
         self._last_solver_gen_backend: str = ""
+        self._last_naive_gen_backend: str = ""
         self.rollout_lora_cache_dir: Optional[str] = None
+        self.rollout_naive_lora_cache_dir: Optional[str] = None
 
         if self.chat_backend == "vllm":
             self._init_vllm_backend(
@@ -96,6 +100,20 @@ class Model:
         else:
             raise ValueError(f"未知 chat_backend: {chat_backend!r}，可选 hf / vllm")
 
+    @staticmethod
+    def _parse_train_devices(devices) -> tuple[str, str]:
+        """解析 naive / solver 训练卡；vLLM 模式可传 1 或 2 个 device。"""
+        if devices is None:
+            return "cuda:0", "cuda:0"
+        if isinstance(devices, str):
+            parts = [d.strip() for d in devices.split(",") if d.strip()]
+        else:
+            parts = [str(d).strip() for d in devices if str(d).strip()]
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+        dev = parts[0] if parts else "cuda:0"
+        return dev, dev
+
     def _init_vllm_backend(
         self,
         *,
@@ -113,18 +131,18 @@ class Model:
         lora_dropout,
         gradient_checkpointing,
     ):
-        """单实例 vLLM 批量推理；solver 训练仍用 HF Agent（单卡）。"""
-        if devices is None:
-            solver_dev = "cuda:0"
-        elif isinstance(devices, str):
-            parts = [d.strip() for d in devices.split(",") if d.strip()]
-            solver_dev = parts[-1] if parts else "cuda:0"
-        else:
-            solver_dev = devices[-1] if devices else "cuda:0"
+        """单实例 vLLM 批量推理；naive/solver 训练用 HF Agent（各一张卡）。"""
+        naive_dev, solver_dev = self._parse_train_devices(devices)
+        if naive_dev == solver_dev:
+            logger.warning(
+                "naive 与 solver 共用训练卡 %s，双 Agent 显存压力较大",
+                solver_dev,
+            )
 
         logger.info(
-            "chat_backend=vllm: tp_size=%d solver_train_device=%s",
+            "chat_backend=vllm: tp_size=%d naive_train=%s solver_train=%s",
             vllm_tp_size,
+            naive_dev,
             solver_dev,
         )
 
@@ -140,6 +158,7 @@ class Model:
                 temperature=temperature,
                 enable_lora=bool(use_lora),
                 max_lora_rank=int(lora_r),
+                max_loras=2 if use_lora else 1,
             )
         )
 
@@ -148,7 +167,21 @@ class Model:
         else:
             self.input_trigger = VllmInputTrigger(self)
             logger.info("input_trigger 已启用（vLLM + prompt/input_trriger.txt）")
-        self.naivesolver = None
+        agent_kw = dict(
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        self.naivesolver = Agent(
+            model_path=model_path_train,
+            system_prompt=self._prompt_naive,
+            device=naive_dev,
+            lr=lr,
+            trainable=True,
+            use_lora=use_lora,
+            **agent_kw,
+        )
         self.solver = Agent(
             model_path=model_path_train,
             system_prompt=self._prompt_solver,
@@ -156,10 +189,7 @@ class Model:
             lr=lr,
             trainable=True,
             use_lora=use_lora,
-            lora_r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            gradient_checkpointing=gradient_checkpointing,
+            **agent_kw,
         )
 
     def _init_hf_backend(
@@ -208,8 +238,10 @@ class Model:
             model_path=model_path,
             system_prompt=self._prompt_naive,
             device=naive_dev,
-            trainable=False,
-            use_lora=False,
+            lr=lr,
+            trainable=True,
+            use_lora=use_lora,
+            **lora_kwargs,
         )
         self.solver = Agent(
             model_path=model_path,
@@ -229,6 +261,7 @@ class Model:
         *,
         lora_path: Optional[str] = None,
         lora_int_id: int = 1,
+        lora_name: str = "solver",
     ) -> list:
         if n <= 0:
             return []
@@ -238,20 +271,28 @@ class Model:
             system_prompt=system_prompt,
             lora_path=lora_path,
             lora_int_id=lora_int_id,
+            lora_name=lora_name,
         )
+
+    def _export_agent_lora(self, agent: Agent, path: str, role: str) -> str:
+        if not self._use_lora:
+            raise RuntimeError(f"export_{role}_lora 需要 --use_lora")
+        out = Path(path).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        agent.save(str(out))
+        if not (out / "adapter_config.json").exists():
+            raise RuntimeError(
+                f"{role} LoRA 导出失败，缺少 adapter_config.json: {out}"
+            )
+        return str(out)
 
     def export_solver_lora(self, path: str) -> str:
         """将当前 solver LoRA 导出到目录，供 vLLM 验证加载。"""
-        if not self._use_lora:
-            raise RuntimeError("export_solver_lora 需要 --use_lora")
-        out = Path(path).expanduser()
-        out.mkdir(parents=True, exist_ok=True)
-        self.solver.save(str(out))
-        if not (out / "adapter_config.json").exists():
-            raise RuntimeError(
-                f"LoRA 导出失败，缺少 adapter_config.json: {out}"
-            )
-        return str(out)
+        return self._export_agent_lora(self.solver, path, "solver")
+
+    def export_naive_lora(self, path: str) -> str:
+        """将当前 naive LoRA 导出到目录，供 vLLM rollout/验证加载。"""
+        return self._export_agent_lora(self.naivesolver, path, "naive")
 
     def sync_solver_lora_for_vllm(self, cache_dir: str, *, lora_int_id: int) -> str:
         """导出当前 HF LoRA 到 cache_dir，供 vLLM rollout/验证加载（与内存权重一致）。"""
@@ -259,8 +300,35 @@ class Model:
         self.set_solver_lora_snapshot(path, lora_int_id=lora_int_id)
         return path
 
+    def sync_naive_lora_for_vllm(self, cache_dir: str, *, lora_int_id: int) -> str:
+        path = self.export_naive_lora(cache_dir)
+        self.set_naive_lora_snapshot(path, lora_int_id=lora_int_id)
+        return path
+
     def clear_solver_lora_snapshot(self) -> None:
         self.set_solver_lora_snapshot(None)
+
+    def clear_naive_lora_snapshot(self) -> None:
+        self.set_naive_lora_snapshot(None)
+
+    def clear_rollout_lora_snapshots(self) -> None:
+        self.clear_solver_lora_snapshot()
+        self.clear_naive_lora_snapshot()
+
+    def sync_rollout_loras_for_vllm(self) -> None:
+        """将 HF 上 naive/solver LoRA 同步到 vLLM（rollout / 验证前调用）。"""
+        if self.chat_backend != "vllm" or not self._use_lora:
+            return
+        if self.rollout_lora_cache_dir:
+            self.sync_solver_lora_for_vllm(
+                str(Path(self.rollout_lora_cache_dir) / "solver"),
+                lora_int_id=1,
+            )
+        if self.rollout_naive_lora_cache_dir:
+            self.sync_naive_lora_for_vllm(
+                str(Path(self.rollout_naive_lora_cache_dir) / "naive"),
+                lora_int_id=2,
+            )
 
     def set_solver_lora_snapshot(
         self,
@@ -271,6 +339,15 @@ class Model:
         """设置 vLLM LoRA 快照路径；None 表示清除。"""
         self._solver_lora_path = str(path).strip() if path else None
         self._solver_lora_int_id = max(1, int(lora_int_id))
+
+    def set_naive_lora_snapshot(
+        self,
+        path: Optional[str],
+        *,
+        lora_int_id: int = 2,
+    ) -> None:
+        self._naive_lora_path = str(path).strip() if path else None
+        self._naive_lora_int_id = max(1, int(lora_int_id))
 
     def resolve_solver_gen_backend(self, *, use_trainable_solver: bool) -> str:
         """
@@ -305,6 +382,59 @@ class Model:
             )
         return backend
 
+    def resolve_naive_gen_backend(self, *, use_trainable_naive: bool) -> str:
+        if not use_trainable_naive:
+            if self.chat_backend == "vllm":
+                return "vllm_base"
+            return "hf_base"
+
+        if self.chat_backend == "vllm" and self._naive_lora_path:
+            return "vllm_lora"
+        if self._use_lora or getattr(self.naivesolver, "use_lora", False):
+            return "hf_lora"
+        return "hf_full"
+
+    def ensure_naive_not_base(self, *, context: str) -> str:
+        backend = self._last_naive_gen_backend or "unknown"
+        if backend in ("vllm_base", "hf_base"):
+            raise RuntimeError(
+                f"{context} 的 naive 生成误用冻结基座 ({backend})。"
+                "请确认 --use_lora，且 rollout/验证未关闭 use_trainable_naive。"
+            )
+        if backend == "hf_full" and self.chat_backend == "vllm":
+            logger.warning(
+                "%s: naive 走 HF 全参微调（未启用 LoRA），显存占用大",
+                context,
+            )
+        return backend
+
+    def _generate_naive_codes_impl(
+        self,
+        question: str,
+        n: int,
+        *,
+        use_trainable_naive: bool,
+    ) -> list:
+        n = max(1, int(n))
+        backend = self.resolve_naive_gen_backend(
+            use_trainable_naive=use_trainable_naive
+        )
+        self._last_naive_gen_backend = backend
+
+        if backend == "vllm_base":
+            return self._vllm_batch(self._prompt_naive, question, n)
+        if backend == "vllm_lora":
+            assert self._naive_lora_path
+            return self._vllm_batch(
+                self._prompt_naive,
+                question,
+                n,
+                lora_path=self._naive_lora_path,
+                lora_int_id=self._naive_lora_int_id,
+                lora_name="naive",
+            )
+        return [self.naivesolver.chat(question) for _ in range(n)]
+
     def _generate_solver_codes_impl(
         self,
         question: str,
@@ -328,6 +458,7 @@ class Model:
                 n,
                 lora_path=self._solver_lora_path,
                 lora_int_id=self._solver_lora_int_id,
+                lora_name="solver",
             )
         return [self.solver.chat(question) for _ in range(n)]
 
@@ -364,6 +495,7 @@ class Model:
         idx=None,
         *,
         use_trainable_solver: bool = True,
+        use_trainable_naive: bool = True,
     ):
         outs, input_src = self.resolve_inputs(question, input_count, idx=idx)
         logger.info(
@@ -374,8 +506,10 @@ class Model:
         )
 
         if self.chat_backend == "vllm":
-            naive_codes = self._vllm_batch(
-                self._prompt_naive, question, naive_bestofn
+            naive_codes = self._generate_naive_codes_impl(
+                question,
+                naive_bestofn,
+                use_trainable_naive=use_trainable_naive,
             )
             if use_trainable_solver:
                 solver_codes = self._generate_solver_codes_impl(
@@ -427,9 +561,27 @@ class Model:
             code = self.input_trigger.chat(question)
 
         code = utils.clean_code(code)
-        stdout, _stderr = utils.run_code(code, **self._exec_kwargs)
-        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        return lines[:count]
+        if not code.strip():
+            return []
+
+        need = max(1, int(count))
+        inputs: list = []
+        max_attempts = max(need * 3, need)
+        attempts = 0
+
+        while len(inputs) < need and attempts < max_attempts:
+            attempts += 1
+            stdout, stderr = utils.run_code(code, **self._exec_kwargs)
+            if (stderr or "").strip():
+                continue
+
+            for case in utils.parse_trigger_stdout(stdout):
+                if case.strip():
+                    inputs.append(case)
+                if len(inputs) >= need:
+                    break
+
+        return inputs[:need]
 
 
 if __name__ == "__main__":

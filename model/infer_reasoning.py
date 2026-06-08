@@ -112,11 +112,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _default_dataset_path(dataset: str) -> str:
-    if dataset == "apps":
-        return str(Path.home() / "lzh/datasets/APPS/train")
-    if dataset == "codecontests":
-        return str(Path.home() / "datasets/codecontests")
-    return str(Path.home() / "lzh/datasets/codecontestplus")
+    from alldatasets.loader import default_dataset_path
+
+    return default_dataset_path(dataset)
 
 
 def _parse_roles(raw: str) -> List[str]:

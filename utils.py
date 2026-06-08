@@ -8,6 +8,24 @@ from collections import Counter
 
 import subprocess
 
+QWEN3_NO_THINK_SUFFIX = "/no_think"
+
+
+def is_qwen3_model(model: str) -> bool:
+    """模型名/路径含 qwen3 时视为 Qwen3 系列（如 Qwen3-8B）。"""
+    return "qwen3" in (model or "").lower()
+
+
+def append_no_think_if_qwen3(user_content: str, model: str) -> str:
+    """Qwen3 需在用户消息末尾加 /no_think 以关闭 thinking 模式。"""
+    if not is_qwen3_model(model):
+        return user_content
+    content = (user_content or "").rstrip()
+    if content.endswith(QWEN3_NO_THINK_SUFFIX):
+        return user_content
+    return content + QWEN3_NO_THINK_SUFFIX
+
+
 def run_program(language, filename, input_data):
     language = language.lower()
 
@@ -187,11 +205,32 @@ def count_outcome(dataset, language):
 
     counter = Counter(outcomes)
     return counter
+_THINKING_TAG_RE = re.compile(
+    r"<\s*(?:redacted_)?think(?:ing)?\s*>.*?<\s*/\s*(?:redacted_)?think(?:ing)?\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_THINKING_OPEN_RE = re.compile(
+    r"^\s*<\s*(?:redacted_)?think(?:ing)?\s*>",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    """去掉 Qwen3 等模型的  /  包裹段。"""
+    if not text:
+        return ""
+    cleaned = _THINKING_TAG_RE.sub("", text)
+    if _THINKING_OPEN_RE.search(cleaned):
+        cleaned = _THINKING_OPEN_RE.sub("", cleaned, count=1)
+    return cleaned.strip()
+
+
 def clean_code(text: str) -> str:
     """
     提取 markdown 中的 python 代码块。
-    如果没有代码块则返回原文本。
+    如果没有代码块则返回原文本（会先剥离 thinking 标签）。
     """
+    text = _strip_thinking_tags(text or "")
 
     pattern = r"```(?:python)?\s*\n(.*?)```"
 
@@ -203,7 +242,7 @@ def clean_code(text: str) -> str:
 
     if matches:
         return "\n\n".join(
-            code.strip()
+            _strip_thinking_tags(code.strip())
             for code in matches
         )
 
@@ -221,10 +260,62 @@ def _inject_kwargs(kwargs):
         "value": kw.get("inject_value", 10),
         "timeout": kw.get("timeout", 10),
         "max_rounds": kw.get("inject_max_rounds", 32),
-        "enabled": kw.get("inject_backoff", True),
+        "enabled": kw.get("inject_backoff", False),
         "label": label,
         "stdin": stdin,
     }, kw
+
+
+def normalize_trigger_output(stdout: str) -> str:
+    """trigger 脚本一次 print 的 stdout 即一条完整 stdin 测例（可含多行）。"""
+    return (stdout or "").replace("\r\n", "\n").rstrip("\n")
+
+
+def parse_trigger_stdout(stdout: str) -> list:
+    """
+    将 trigger stdout 解析为完整测例列表。
+    默认整段 stdout 为一条；若可识别多组「首行 T + T 行」则拆开。
+    """
+    text = normalize_trigger_output(stdout)
+    if not text:
+        return []
+
+    lines = text.split("\n")
+    cases: list = []
+    i, n = 0, len(lines)
+
+    while i < n:
+        while i < n and not lines[i].strip():
+            i += 1
+        if i >= n:
+            break
+
+        head = lines[i].strip()
+        if head.isdigit():
+            t = int(head)
+            end = i + 1 + t
+            if 0 <= t <= 100_000 and end <= n and all(
+                lines[j].strip() for j in range(i + 1, end)
+            ):
+                cases.append("\n".join(lines[i:end]))
+                i = end
+                continue
+
+        j = i + 1
+        while j < n:
+            if not lines[j].strip():
+                break
+            if lines[j].strip().isdigit():
+                t2 = int(lines[j].strip())
+                if 0 <= t2 <= 100_000 and j + 1 + t2 <= n:
+                    break
+            j += 1
+        chunk = "\n".join(lines[i:j]).strip("\n")
+        if chunk:
+            cases.append(chunk)
+        i = j if j > i else i + 1
+
+    return cases if cases else [text]
 
 
 def run_code(code: str, input_str: str = "", timeout=10, **kwargs):
@@ -313,14 +404,15 @@ def solver_passes_all_cases(
     expected_outputs: list,
     **run_kw,
 ) -> bool:
-    """单份代码是否通过全部 (input, output) 测例。"""
+    """单份代码是否通过全部 (input, output) 测例（评测：直接执行，无注入退避）。"""
     code = clean_code(code)
     if not code.strip():
         return False
     if len(inputs) != len(expected_outputs) or not inputs:
         return False
+    timeout = int(run_kw.get("timeout", 10))
     for inp, exp in zip(inputs, expected_outputs):
-        stdout, stderr = run_solve(code, inp, **run_kw)
+        stdout, stderr = run_solve_plain(code, inp, timeout=timeout)
         if not run_solve_ok(stderr) or not outputs_match(stdout, exp):
             return False
     return True
@@ -342,5 +434,6 @@ def solver_pass_at_1(
 def _run_solve_worker(payload):
     """ProcessPool 可 pickle 的顶层函数。返回 (stdout, stderr)。"""
     code, input_str, kwargs = payload
-    stdout, stderr = run_solve(code, input_str, **kwargs)
+    timeout = int(kwargs.get("timeout", 10))
+    stdout, stderr = run_solve_plain(code, input_str, timeout=timeout)
     return stdout.strip(), stderr or ""

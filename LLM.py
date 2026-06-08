@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import utils
+
 # 503/502 等网关临时错误：自动重试
 RETRIABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
@@ -118,6 +120,7 @@ class LLMConfig:
     max_model_len: Optional[int] = None
     enable_lora: bool = False
     max_lora_rank: int = 64
+    max_loras: int = 1
 
     use_zero: bool = False
     zero_stage: int = 3
@@ -175,7 +178,7 @@ class LLM:
             vllm_kwargs["max_model_len"] = int(self.config.max_model_len)
         if self.config.enable_lora:
             vllm_kwargs["enable_lora"] = True
-            vllm_kwargs["max_loras"] = 1
+            vllm_kwargs["max_loras"] = max(1, int(self.config.max_loras))
             vllm_kwargs["max_lora_rank"] = max(1, int(self.config.max_lora_rank))
 
         self._model = VLLMEngine(**vllm_kwargs)
@@ -219,6 +222,8 @@ class LLM:
         return [self._chat_api(u, sys_prompt) for u in user_contents]
 
     def _build_messages(self, user_content: str, system_prompt: str) -> List[Dict[str, str]]:
+        model_ref = self.config.model_path or self.config.model
+        user_content = utils.append_no_think_if_qwen3(user_content, model_ref)
         messages: List[Dict[str, str]] = []
         if system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt})

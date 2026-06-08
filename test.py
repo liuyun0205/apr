@@ -133,11 +133,10 @@ def _run_one_case(
     print("--- input (repr) ---")
     print(repr(input_str[:500] + ("..." if len(input_str) > 500 else "")))
 
-    stdout, stderr = utils.run_solve(
+    stdout, stderr = utils.run_solve_plain(
         code,
         input_str,
         timeout=timeout,
-        exec_label="test",
     )
     actual = _normalize_output(stdout)
 

@@ -185,3 +185,26 @@ CUDA_VISIBLE_DEVICES=1,2,3 python model/train.py \
 # python model/kill_pass1_gpu.py   # 若旧进程占卡先清理
 # python model/run_pass1_codecontests_gpu3456.py
 # 结果: outputs/pass1_eval_codecontests/*_summary.json
+
+# ---------- alldatasets 统一评测（物理卡 1）----------
+# 数据：~/lzh/datasets/{LiveCodeBench,codeforces}/test/
+# codeforces: test/test-00000-of-00001.parquet
+MODEL=~/lzh/Qwen2.5-Coder-7B-Instruct
+
+# LiveCodeBench
+python alldatasets/eval.py \
+  --dataset livecodebench \
+  --model-type local \
+  --model "$MODEL" \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+
+# CodeForces
+python alldatasets/eval.py \
+  --dataset codeforces \
+  --model-type local \
+  --model "$MODEL" \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume

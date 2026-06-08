@@ -139,7 +139,7 @@ class APPS:
         self,
         path: str = "~/get_codeforces_data/APPS/train",
         *,
-        strip_samples: bool = True,
+        strip_samples: bool = False,
         require_question: bool = True,
     ):
         self.path = Path(path).expanduser()

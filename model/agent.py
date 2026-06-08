@@ -4,6 +4,8 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import utils
+
 # Qwen / Llama 类模型常用的 LoRA 注入层
 DEFAULT_LORA_TARGET_MODULES = (
     "q_proj",
@@ -35,6 +37,7 @@ class Agent:
         lora_path: str = "",
     ):
         self.device = device
+        self.model_path = model_path
         self.system_prompt = system_prompt
         self.use_lora = use_lora
         self.trainable = trainable
@@ -126,6 +129,7 @@ class Agent:
         self.model.print_trainable_parameters()
 
     def build_prompt(self, question: str) -> str:
+        question = utils.append_no_think_if_qwen3(question, self.model_path)
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": question},
@@ -140,6 +144,7 @@ class Agent:
     def chat(self, prompt, max_new_tokens=1024, temperature=0.7):
         self.model.eval()
 
+        prompt = utils.append_no_think_if_qwen3(prompt, self.model_path)
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt},

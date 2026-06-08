@@ -33,10 +33,43 @@ _HARBOR_SECTION_MARKERS = (
 )
 
 _PROB_RE = re.compile(r"^code_contests-\d+$")
+_SAMPLE_OUT_STOP = re.compile(
+    r"(?im)^\s*(?:explanation|##\s|note\s*:|\Z)"
+)
 
 
-def extract_instruction_description(text: str, *, strip_samples: bool = True) -> str:
-    """从 Harbor instruction.md 提取纯题面（去掉元数据段与样例 I/O）。"""
+def parse_instruction_sample_io(text: str) -> tuple[List[str], List[str]]:
+    """
+    从 instruction.md 题干 Example 段提取样例 input/output（单组或多组）。
+    不用 tests/test_data.json 里的隐藏测例。
+    """
+    if not (text or "").strip():
+        return [], []
+
+    chunk = text
+    m_example = re.search(r"(?im)^\s*example\b", text)
+    if m_example:
+        chunk = text[m_example.start() :]
+
+    m_in = re.search(r"(?is)(?:^|\n)\s*input\s*:?\s*\n(.*)", chunk)
+    if not m_in:
+        return [], []
+    after_in = m_in.group(1)
+
+    m_out = re.search(r"(?is)\n\s*output\s*:?\s*\n(.*)", after_in)
+    if not m_out:
+        return [], []
+
+    inp_block = after_in[: m_out.start()].strip("\n")
+    out_block = _SAMPLE_OUT_STOP.split(m_out.group(1), maxsplit=1)[0].strip("\n")
+
+    if not inp_block.strip() or not out_block.strip():
+        return [], []
+    return [inp_block], [out_block]
+
+
+def extract_instruction_description(text: str, *, strip_samples: bool = False) -> str:
+    """从 Harbor instruction.md 提取题面；默认保留 Input/Output/Constraints/Example。"""
     lines = text.splitlines()
     body_lines: List[str] = []
     for line in lines:
@@ -102,13 +135,33 @@ class CodeContests:
         self,
         path: str = "~/datasets/codecontests",
         *,
-        strip_samples: bool = True,
+        strip_samples: bool = False,
         require_instruction: bool = True,
         cache_dir: str = "",
+        io_source: str = "",
+        rollout_io_source: str = "tests",
+        public_io_source: str = "sample",
     ):
         self.path = Path(path).expanduser()
         self.strip_samples = strip_samples
         self.require_instruction = require_instruction
+        legacy = (io_source or "").strip().lower()
+        self.rollout_io_source = (
+            (rollout_io_source or legacy or "tests").strip().lower()
+        )
+        self.public_io_source = (
+            (public_io_source or "sample").strip().lower()
+        )
+        for name, src in (
+            ("rollout_io_source", self.rollout_io_source),
+            ("public_io_source", self.public_io_source),
+        ):
+            if src not in ("tests", "sample"):
+                raise ValueError(
+                    f"{name} 须为 tests 或 sample，收到: {src!r}"
+                )
+        # 兼容旧字段
+        self.io_source = self.rollout_io_source
 
         if self.path.is_file() and self.path.suffix == ".parquet":
             self._mode = "parquet"
@@ -280,22 +333,51 @@ class CodeContests:
     def problem_dir(self, idx) -> Path:
         return self._ensure_extracted(idx)
 
-    def get_io_inputs(self, idx, max_count: int = 10) -> List[str]:
+    def _load_io_pairs(
+        self,
+        idx: int,
+        *,
+        source: Optional[str] = None,
+    ) -> tuple[List[str], List[str]]:
+        src = (source or self.rollout_io_source).strip().lower()
         prob_dir = self.problem_dir(idx)
+        if src == "sample":
+            inst_path = prob_dir / "instruction.md"
+            if not inst_path.exists():
+                return [], []
+            return parse_instruction_sample_io(_read_text(inst_path))
+
         io_path = prob_dir / "tests" / "test_data.json"
         if not io_path.exists():
-            return []
-        inputs = parse_input_output_inputs(_read_text(io_path))
+            return [], []
+        text = _read_text(io_path)
+        return (
+            parse_input_output_inputs(text),
+            parse_input_output_outputs(text),
+        )
+
+    def get_io_inputs(self, idx, max_count: int = 10) -> List[str]:
+        """rollout / 评测打分：默认 tests/test_data.json。"""
+        inputs, _outputs = self._load_io_pairs(idx, source=self.rollout_io_source)
         if max_count > 0:
             return inputs[:max_count]
         return inputs
 
     def get_io_outputs(self, idx, max_count: int = 10) -> List[str]:
-        prob_dir = self.problem_dir(idx)
-        io_path = prob_dir / "tests" / "test_data.json"
-        if not io_path.exists():
-            return []
-        outputs = parse_input_output_outputs(_read_text(io_path))
+        _inputs, outputs = self._load_io_pairs(idx, source=self.rollout_io_source)
+        if max_count > 0:
+            return outputs[:max_count]
+        return outputs
+
+    def get_public_io_inputs(self, idx, max_count: int = 0) -> List[str]:
+        """验证 / Public Test bonus：默认题干 Example。"""
+        inputs, _outputs = self._load_io_pairs(idx, source=self.public_io_source)
+        if max_count > 0:
+            return inputs[:max_count]
+        return inputs
+
+    def get_public_io_outputs(self, idx, max_count: int = 0) -> List[str]:
+        _inputs, outputs = self._load_io_pairs(idx, source=self.public_io_source)
         if max_count > 0:
             return outputs[:max_count]
         return outputs

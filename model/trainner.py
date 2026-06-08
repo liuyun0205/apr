@@ -1,46 +1,10 @@
-import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 
 import utils
 
-logger = logging.getLogger(__name__)
-
 class MultiTrainer:
-    _LOG_PREVIEW = 500
-
-    @staticmethod
-    def _preview_text(text: str, limit: int | None = None) -> str:
-        limit = limit or MultiTrainer._LOG_PREVIEW
-        t = (text or "").replace("\r\n", "\n")
-        if len(t) <= limit:
-            return t
-        return t[:limit] + f"... ({len(t)} chars)"
-
-    @staticmethod
-    def _log_exec_result(
-        role: str,
-        input_idx: int,
-        cand_idx: int,
-        stdout: str,
-        stderr: str,
-        *,
-        match: int | None = None,
-    ) -> None:
-        status = "ok" if utils.run_solve_ok(stderr) else (stderr or "fail")
-        extra = f" match={match}" if match is not None else ""
-        logger.info(
-            "[%s] input=%d cand=%d status=%s%s\nstdout:\n%s\nstderr: %s",
-            role,
-            input_idx,
-            cand_idx,
-            status,
-            extra,
-            MultiTrainer._preview_text(stdout),
-            (stderr or "(empty)")[:300],
-        )
-
     @staticmethod
     def _compare_cell(solver_out: str, solver_err: str, naive_out: str, naive_err: str) -> int:
         """失败/超时视为 0（不匹配 naive）。"""
@@ -50,12 +14,8 @@ class MultiTrainer:
 
     @staticmethod
     def _run_one(code: str, input_case: str, run_kw: dict, label: str) -> tuple[str, str]:
-        stdout, stderr = utils.run_solve(
-            code,
-            input_case,
-            exec_label=label,
-            **run_kw,
-        )
+        timeout = int(run_kw.get("timeout", 10))
+        stdout, stderr = utils.run_solve_plain(code, input_case, timeout=timeout)
         return stdout.strip(), stderr or ""
 
     def get_logprob(self, agent, prompt, code):
@@ -126,6 +86,47 @@ class MultiTrainer:
 
         return loss.item()
 
+    @staticmethod
+    def _public_confidence(naive_public_pass: list) -> tuple[float, float]:
+        """w = 通过 Public Test 的 Naive 比例；c = 2w - 1。"""
+        n = len(naive_public_pass)
+        if n == 0:
+            return 0.0, 0.0
+        w = sum(naive_public_pass) / n
+        return w, 2.0 * w - 1.0
+
+    def build_public_pass_flags(
+        self,
+        solver_codes,
+        naive_codes,
+        public_inputs,
+        public_outputs,
+        exec_kwargs=None,
+    ) -> tuple[list[int], list[int]]:
+        """
+        在题干样例（Public Test）上评测，返回 (solver_pass, naive_pass)。
+        各元素为 1/0：是否通过全部 Public Test。
+        """
+        run_kw = dict(exec_kwargs or {})
+        run_kw.pop("exec_workers", None)
+        has_public = bool(public_inputs) and len(public_inputs) == len(public_outputs or [])
+
+        solver_pass = [
+            1
+            if has_public
+            and utils.solver_passes_all_cases(code, public_inputs, public_outputs, **run_kw)
+            else 0
+            for code in solver_codes
+        ]
+        naive_pass = [
+            1
+            if has_public
+            and utils.solver_passes_all_cases(code, public_inputs, public_outputs, **run_kw)
+            else 0
+            for code in naive_codes
+        ]
+        return solver_pass, naive_pass
+
     def _build_matrices_serial(
         self,
         solver_codes,
@@ -135,12 +136,6 @@ class MultiTrainer:
     ):
         all_matrices = []
         for in_idx, input_case in enumerate(inputs):
-            logger.info(
-                "--- 测例 input=%d len=%d ---\n%s",
-                in_idx,
-                len(input_case),
-                self._preview_text(repr(input_case), limit=300),
-            )
             matrix = []
             for si, solver_code in enumerate(solver_codes):
                 row = []
@@ -153,21 +148,6 @@ class MultiTrainer:
                     )
                     cell = self._compare_cell(
                         solver_out, solver_err, naive_out, naive_err
-                    )
-                    if ni == 0:
-                        self._log_exec_result(
-                            "solver", in_idx, si, solver_out, solver_err
-                        )
-                    if si == 0:
-                        self._log_exec_result(
-                            "naive", in_idx, ni, naive_out, naive_err
-                        )
-                    logger.info(
-                        "[match] input=%d solver=%d naive=%d -> %d",
-                        in_idx,
-                        si,
-                        ni,
-                        cell,
                     )
                     row.append(cell)
                 matrix.append(row)
@@ -223,35 +203,14 @@ class MultiTrainer:
 
         all_matrices = []
         for in_idx, input_case in enumerate(inputs):
-            logger.info(
-                "--- 测例 input=%d len=%d ---\n%s",
-                in_idx,
-                len(input_case),
-                self._preview_text(repr(input_case), limit=300),
-            )
-            for ni in range(len(naive_codes)):
-                naive_out, naive_err = naive_out_map[(in_idx, ni)]
-                self._log_exec_result(
-                    "naive", in_idx, ni, naive_out, naive_err
-                )
             matrix = []
             for si, _solver_code in enumerate(solver_codes):
                 row = []
                 solver_out, solver_err = solver_out_map[(in_idx, si)]
-                self._log_exec_result(
-                    "solver", in_idx, si, solver_out, solver_err
-                )
                 for ni, _naive_code in enumerate(naive_codes):
                     naive_out, naive_err = naive_out_map[(in_idx, ni)]
                     cell = self._compare_cell(
                         solver_out, solver_err, naive_out, naive_err
-                    )
-                    logger.info(
-                        "[match] input=%d solver=%d naive=%d -> %d",
-                        in_idx,
-                        si,
-                        ni,
-                        cell,
                     )
                     row.append(cell)
                 matrix.append(row)
@@ -259,6 +218,7 @@ class MultiTrainer:
         return all_matrices
 
     def build_matrices(self, candidates, exec_kwargs=None):
+        """在 m 条随机/rollout 输入上构建共识矩阵 M_j。"""
         naive_codes = candidates["naive_codes"]
         solver_codes = candidates["solver_codes"]
         inputs = candidates["inputs"]
@@ -270,11 +230,6 @@ class MultiTrainer:
                 solver_codes, naive_codes, inputs, run_kw
             )
 
-        logger.info(
-            "build_matrices 多进程执行: workers=%d tasks=%d",
-            workers,
-            len(inputs) * (len(solver_codes) + len(naive_codes)),
-        )
         return self._build_matrices_parallel(
             solver_codes,
             naive_codes,
@@ -283,18 +238,25 @@ class MultiTrainer:
             workers,
         )
 
-    def calc_solver_rewards(self, all_matrices, solver_pass_flags, naive_pass_flags, beta=0.3):
+
+
+    def calc_solver_rewards(
+        self,
+        all_matrices,
+        solver_public_pass,
+        naive_public_pass,
+        beta=0.3,
+    ):
         """
-        all_matrices[input_idx][solver_idx][naive_idx]
-            solver 和 naive 是否一致，1/0
+        Solver-Naive Cooperative RL Reward（Solver 侧）。
 
-        solver_pass_flags[input_idx][solver_idx]
-            solver 是否通过题干样例，1/0
+        R_{s,i} = (1/m) Σ_j [ S_{i,j} + β·c·A_i ]
 
-        naive_pass_flags[input_idx][naive_idx]
-            naive 是否通过题干样例，1/0
+        - M_{i,k,j} = all_matrices[j][i][k]（随机输入 j 上输出是否一致）
+        - S_{i,j} = Σ_k M_{i,k,j} / max_r Σ_k M_{r,k,j}
+        - w = (#通过 Public Test 的 Naive) / N_n，c = 2w - 1
+        - A_i = 1[solver_i 通过 Public Test]
         """
-
         if not all_matrices:
             return []
 
@@ -303,128 +265,73 @@ class MultiTrainer:
         if num_solvers == 0:
             return []
 
-        num_naives = len(all_matrices[0][0])
-        if num_naives == 0:
-            return []
-
+        _w, c_j = self._public_confidence(naive_public_pass)
         rewards = [0.0] * num_solvers
 
-        for input_idx, matrix in enumerate(all_matrices):
-            # w_j：当前 input 上 naive 集体可信度
-            w_j = sum(naive_pass_flags[input_idx]) / num_naives
-            confidence = 2.0 * w_j - 1.0
-
+        for matrix in all_matrices:
             row_sums = [sum(row) for row in matrix]
-            max_sum = max(row_sums)
+            max_sum = max(row_sums) if row_sums else 0
 
             for solver_idx in range(num_solvers):
-                # S_{i,j}：solver 被 naive 支持的归一化分数
                 if max_sum == 0:
-                    S_ij = 0.0
+                    s_ij = 0.0
                 else:
-                    S_ij = row_sums[solver_idx] / max_sum
+                    s_ij = row_sums[solver_idx] / max_sum
 
-                # A_{i,j}：solver 是否通过题干样例
-                A_ij = solver_pass_flags[input_idx][solver_idx]
-
-                reward = S_ij + beta * confidence * A_ij
-
-                rewards[solver_idx] += reward
+                a_i = (
+                    solver_public_pass[solver_idx]
+                    if solver_idx < len(solver_public_pass)
+                    else 0
+                )
+                rewards[solver_idx] += s_ij + beta * c_j * a_i
 
         return [r / num_inputs for r in rewards]
 
-    def calc_solver_rewards(self, all_matrices, solver_pass_flags, naive_pass_flags, beta=0.3):
+    def calc_naive_rewards(
+        self,
+        all_matrices,
+        naive_public_pass,
+        alpha=0.3,
+    ):
         """
-        all_matrices[input_idx][solver_idx][naive_idx]
-            solver 和 naive 是否一致，1/0
+        Solver-Naive Cooperative RL Reward（Naive 侧）。
 
-        solver_pass_flags[input_idx][solver_idx]
-            solver 是否通过题干样例，1/0
+        R_{n,k} = (1/m) Σ_j [ C_{k,j} + α·c·N_k ]
 
-        naive_pass_flags[input_idx][naive_idx]
-            naive 是否通过题干样例，1/0
+        - C_{k,j} = Σ_i M_{i,k,j} / max_r Σ_i M_{i,r,j}
+        - N_k = 1[naive_k 通过 Public Test]
         """
-
-        if not all_matrices:
-            return []
-
-        num_inputs = len(all_matrices)
-        num_solvers = len(all_matrices[0])
-        if num_solvers == 0:
-            return []
-
-        num_naives = len(all_matrices[0][0])
-        if num_naives == 0:
-            return []
-
-        rewards = [0.0] * num_solvers
-
-        for input_idx, matrix in enumerate(all_matrices):
-            # w_j：当前 input 上 naive 集体可信度
-            w_j = sum(naive_pass_flags[input_idx]) / num_naives
-            confidence = 2.0 * w_j - 1.0
-
-            row_sums = [sum(row) for row in matrix]
-            max_sum = max(row_sums)
-
-            for solver_idx in range(num_solvers):
-                # S_{i,j}：solver 被 naive 支持的归一化分数
-                if max_sum == 0:
-                    S_ij = 0.0
-                else:
-                    S_ij = row_sums[solver_idx] / max_sum
-
-                # A_{i,j}：solver 是否通过题干样例
-                A_ij = solver_pass_flags[input_idx][solver_idx]
-
-                reward = S_ij + beta * confidence * A_ij
-
-                rewards[solver_idx] += reward
-
-        return [r / num_inputs for r in rewards]
-
-    def calc_naive_rewards(self, all_matrices, naive_pass_flags):
-        """
-        all_matrices[input_idx][solver_idx][naive_idx]
-
-        naive_pass_flags[input_idx][naive_idx]
-            naive 是否通过题干样例
-        """
-
         if not all_matrices:
             return []
 
         num_inputs = len(all_matrices)
         num_solvers = len(all_matrices[0])
         num_naives = len(all_matrices[0][0])
+        if num_naives == 0:
+            return []
 
+        _w, c_j = self._public_confidence(naive_public_pass)
         rewards = [0.0] * num_naives
 
-        for input_idx, matrix in enumerate(all_matrices):
-
-            # w_j
-            w_j = (
-                    sum(naive_pass_flags[input_idx])
-                    / num_naives
-            )
-
-            confidence = 2.0 * w_j - 1.0
+        for matrix in all_matrices:
+            col_sums = [
+                sum(matrix[solver_idx][naive_idx] for solver_idx in range(num_solvers))
+                for naive_idx in range(num_naives)
+            ]
+            max_col = max(col_sums) if col_sums else 0
 
             for naive_idx in range(num_naives):
-                # N_{k,j}
-                N_kj = naive_pass_flags[input_idx][naive_idx]
+                if max_col == 0:
+                    c_kj = 0.0
+                else:
+                    c_kj = col_sums[naive_idx] / max_col
 
-                # C_{k,j}
-                support_count = sum(
-                    matrix[solver_idx][naive_idx]
-                    for solver_idx in range(num_solvers)
+                n_k = (
+                    naive_public_pass[naive_idx]
+                    if naive_idx < len(naive_public_pass)
+                    else 0
                 )
-
-                C_kj = support_count / num_solvers
-
-                reward = confidence * N_kj * C_kj
-
-                rewards[naive_idx] += reward
+                rewards[naive_idx] += c_kj + alpha * c_j * n_k
 
         return [r / num_inputs for r in rewards]
     
