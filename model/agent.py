@@ -103,7 +103,10 @@ class Agent:
                 f"LoRA 目录缺少 adapter_config.json: {adapter}"
             )
         self.model = PeftModel.from_pretrained(self.model, adapter)
-        self.model.eval()
+        if self.trainable:
+            self.model.train()
+        else:
+            self.model.eval()
         logging.info("已加载 LoRA adapter: %s", adapter)
 
     def _apply_lora(self, *, r, alpha, dropout, target_modules):

@@ -22,6 +22,8 @@ def default_dataset_path(dataset: str) -> str:
         "ccp": Path("codecontestplus"),
         "codecontests": Path("codecontests"),
         "cc": Path("codecontests"),
+        "cure_codecontests": Path("CURE_codecontests"),
+        "cure_cc": Path("CURE_codecontests"),
         "livecodebench": Path("LiveCodeBench"),
         "lcb": Path("LiveCodeBench"),
         "codeforces": Path("codeforces"),
@@ -68,6 +70,9 @@ def _dataset_defaults(name: str) -> dict:
     if name in ("codecontests", "cc", "code_contests"):
         defaults["rollout_io_source"] = "tests"
         defaults["public_io_source"] = "sample"
+    if name in ("cure_codecontests", "cure_cc"):
+        defaults["rollout_io_source"] = "tests"
+        defaults["public_io_source"] = "sample"
     return defaults
 
 
@@ -89,6 +94,7 @@ def load_dataset(dataset: str, path: str = "", **kwargs):
       - codecontestplus / ccp
       - apps
       - codecontests / cc
+      - cure_codecontests / cure_cc（kwargs: split=train|test）
       - livecodebench / lcb
       - codeforces / cf
     """
@@ -128,6 +134,18 @@ def load_dataset(dataset: str, path: str = "", **kwargs):
         p = _resolve_codecontests_path(p)
         return CodeContests(p, **kwargs)
 
+    if name in ("cure_codecontests", "cure_cc"):
+        from alldatasets.cure_codecontests import CURECodeContests
+
+        p = _resolve_existing_path(
+            raw_path,
+            fallbacks=(
+                str(datasets_root() / "CURE_codecontests"),
+                str(Path.home() / "datasets" / "CURE_codecontests"),
+            ),
+        )
+        return CURECodeContests(p, **kwargs)
+
     if name in ("livecodebench", "lcb"):
         from alldatasets.livecodebench import LiveCodeBench
 
@@ -155,5 +173,6 @@ def load_dataset(dataset: str, path: str = "", **kwargs):
 
     raise ValueError(
         f"未知 dataset={dataset!r}，可选: "
-        "codecontestplus, apps, codecontests, livecodebench, codeforces"
+        "codecontestplus, apps, codecontests, cure_codecontests, "
+        "livecodebench, codeforces"
     )

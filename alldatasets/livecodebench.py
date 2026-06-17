@@ -194,6 +194,23 @@ class LiveCodeBench:
             return outputs[:max_count]
         return outputs
 
+    def get_public_io_inputs(self, idx, max_count: int = 0) -> List[str]:
+        """题干 public 测例 input（probe 回退用）。"""
+        inputs, _outputs = _stdin_cases(
+            _parse_test_cases(self._raw(idx).get("public_test_cases"))
+        )
+        if max_count > 0:
+            return inputs[:max_count]
+        return inputs
+
+    def get_public_io_outputs(self, idx, max_count: int = 0) -> List[str]:
+        _inputs, outputs = _stdin_cases(
+            _parse_test_cases(self._raw(idx).get("public_test_cases"))
+        )
+        if max_count > 0:
+            return outputs[:max_count]
+        return outputs
+
     def foreach(self, func, start=0, end=None):
         if end is None:
             end = len(self.df)

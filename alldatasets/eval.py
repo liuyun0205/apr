@@ -14,6 +14,29 @@
     --dataset codeforces \\
     --dataset-path ~/lzh/datasets/codeforces \\
     --model-type api --model gpt-4o --api-key sk-...
+
+  # CodeContests 全量 pass@1 + BoN（tests/test_data.json 打分）
+  python alldatasets/eval.py \\
+    --dataset codecontests \\
+    --dataset-path ~/lzh/datasets/codecontests/extracted_tasks \\
+    --model-type local --model ~/lzh/Qwen2.5-Coder-7B-Instruct \\
+    --solver-bestofn 3 --gpu 1 --resume
+
+  # 基座 + LoRA adapter（免合并，直接 vLLM 挂载）
+  python alldatasets/eval.py \\
+    --dataset livecodebench \\
+    --model-type local --model ~/lzh/Qwen2.5-Coder-7B-Instruct \\
+    --lora ~/lzh/apr/outputs/naive_solver_rl_cc_tests/final \\
+    --gpu 1 --resume
+
+  # SFT 冷启动 solver LoRA（model/sft_solver.py 产出）
+  python alldatasets/eval.py \\
+    --dataset cure_codecontests \\
+    --dataset-path ~/datasets/CURE_codecontests \\
+    --split test \\
+    --model-type local --model ~/lzh/Qwen2.5-Coder-7B-Instruct \\
+    --lora ~/lzh/apr/outputs/solver_sft/lora/final \\
+    --solver-bestofn 16 --gpu 1 --tensor-parallel-size 1 --resume
 """
 from __future__ import annotations
 
@@ -43,6 +66,7 @@ DATASET_CHOICES = [
     "apps",
     "codecontestplus",
     "codecontests",
+    "cure_codecontests",
     "livecodebench",
     "codeforces",
 ]
@@ -97,6 +121,13 @@ def parse_args() -> argparse.Namespace:
         help="仅使用公开测例（livecodebench/codeforces 的 example/public）",
     )
     p.add_argument(
+        "--split",
+        type=str,
+        default="",
+        choices=["", "train", "test"],
+        help="cure_codecontests 数据 split；评测默认 test",
+    )
+    p.add_argument(
         "--dataset-rollout-io-source",
         type=str,
         default="",
@@ -119,6 +150,18 @@ def parse_args() -> argparse.Namespace:
         choices=["local", "api"],
     )
     p.add_argument("--model", type=str, required=True, help="模型名或本地路径")
+    p.add_argument(
+        "--lora",
+        type=str,
+        default="",
+        help="LoRA adapter 目录（含 adapter_config.json），仅 model-type=local 有效",
+    )
+    p.add_argument(
+        "--max-lora-rank",
+        type=int,
+        default=64,
+        help="vLLM max_lora_rank，需 >= 训练时的 lora_r",
+    )
     p.add_argument("--base-url", type=str, default="")
     p.add_argument("--api-key", type=str, default="")
     p.add_argument(
@@ -143,6 +186,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="失败时打印模型输出/代码/测例对比，并写入 .raw.txt",
     )
+    p.add_argument(
+        "--solver-bestofn",
+        type=int,
+        default=0,
+        help=">0 时启用 pass@1 + BoN：独立生成 1 份算 pass@1，另生成 N 份算 BoN",
+    )
     return p.parse_args()
 
 
@@ -162,10 +211,34 @@ def _resolve_result_dir(args: argparse.Namespace) -> Path:
         return Path(args.result_dir).expanduser()
     model_slug = _slug(Path(args.model).name if "/" in args.model else args.model)
     sub = f"eval_{args.dataset}_{args.model_type}_{model_slug}"
+    if args.dataset == "cure_codecontests":
+        sub += f"_{(args.split or 'test').strip()}"
+    lora = (args.lora or "").strip()
+    if lora:
+        # 用 LoRA 父目录名（一般是 run 名）+ 末级目录名区分，如 naive_solver_rl_cc_tests_final
+        lp = Path(lora).expanduser()
+        sub += f"_lora_{_slug(lp.parent.name + '_' + lp.name)}"
     return Path(args.results_root).expanduser() / sub
 
 
-def _build_llm(args: argparse.Namespace, system_prompt: str) -> LLM:
+def _resolve_lora_path(args: argparse.Namespace) -> Optional[str]:
+    lora = (args.lora or "").strip()
+    if not lora:
+        return None
+    if args.model_type != "local":
+        raise SystemExit("--lora 仅支持 --model-type local（vLLM）")
+    lp = Path(lora).expanduser()
+    if not (lp / "adapter_config.json").is_file():
+        raise SystemExit(f"--lora 目录无 adapter_config.json: {lp}")
+    return str(lp)
+
+
+def _build_llm(
+    args: argparse.Namespace,
+    system_prompt: str,
+    *,
+    lora_path: Optional[str] = None,
+) -> LLM:
     return LLM(
         LLMConfig(
             model_type=args.model_type,
@@ -178,6 +251,8 @@ def _build_llm(args: argparse.Namespace, system_prompt: str) -> LLM:
             temperature=args.temperature,
             tensor_parallel_size=max(1, int(args.tensor_parallel_size)),
             gpu_memory_utilization=float(args.gpu_memory_utilization),
+            enable_lora=bool(lora_path),
+            max_lora_rank=max(1, int(args.max_lora_rank)),
         )
     )
 
@@ -207,6 +282,14 @@ def _load_dataset(args: argparse.Namespace):
             extra["rollout_io_source"] = args.dataset_rollout_io_source
         if args.dataset_public_io_source:
             extra["public_io_source"] = args.dataset_public_io_source
+    if args.dataset in ("cure_codecontests",):
+        extra["split"] = (args.split or "test").strip()
+        if args.dataset_rollout_io_source:
+            extra["rollout_io_source"] = args.dataset_rollout_io_source
+        if args.dataset_public_io_source:
+            extra["public_io_source"] = args.dataset_public_io_source
+        if args.use_public_only:
+            extra["rollout_io_source"] = "sample"
     return load_dataset(args.dataset, path, **extra)
 
 
@@ -218,6 +301,15 @@ def _result_paths(result_dir: Path, pid: str) -> Tuple[Path, Path, Path, Path]:
     err_path = result_dir / f"{fname}.error.txt"
     raw_path = result_dir / f"{fname}.raw.txt"
     return code_path, meta_path, err_path, raw_path
+
+
+def _bon_code_path(result_dir: Path, pid: str, k: int) -> Path:
+    fname = _slug(pid)
+    return result_dir / f"{fname}.bon{k}.py"
+
+
+def _use_pass_bon_mode(args: argparse.Namespace) -> bool:
+    return int(args.solver_bestofn) > 0
 
 
 def _failure_debug_fields(
@@ -274,8 +366,30 @@ def _debug_print_failure(
         print(f"  stderr={debug.get('fail_stderr', '')!r}", flush=True)
 
 
-def _is_done(meta_path: Path, code_path: Path) -> bool:
-    return meta_path.is_file() and code_path.is_file()
+def _is_done(
+    meta_path: Path,
+    code_path: Path,
+    *,
+    bon_n: int = 0,
+    result_dir: Optional[Path] = None,
+    pid: str = "",
+) -> bool:
+    if not meta_path.is_file() or not code_path.is_file():
+        return False
+    if bon_n <= 0:
+        return True
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if "pass_at_1" not in meta or "bon_pass" not in meta:
+        return False
+    if result_dir is None:
+        return False
+    for k in range(bon_n):
+        if not _bon_code_path(result_dir, pid, k).is_file():
+            return False
+    return True
 
 
 def _evaluate_code(
@@ -330,17 +444,105 @@ def _evaluate_code(
     }
 
 
-def _chat_with_retry(llm: LLM, question: str, *, retries: int, sleep_s: float) -> str:
+def _chat_with_retry(
+    llm: LLM,
+    question: str,
+    *,
+    retries: int,
+    sleep_s: float,
+    lora_path: Optional[str] = None,
+) -> str:
+    return _chat_batch_with_retry(
+        llm,
+        [question],
+        retries=retries,
+        sleep_s=sleep_s,
+        lora_path=lora_path,
+    )[0]
+
+
+def _chat_batch_with_retry(
+    llm: LLM,
+    questions: List[str],
+    *,
+    retries: int,
+    sleep_s: float,
+    lora_path: Optional[str] = None,
+) -> List[str]:
+    if not questions:
+        return []
     last_err: Optional[Exception] = None
     for attempt in range(max(1, retries + 1)):
         try:
-            return llm.chat(question).strip()
+            return [
+                t.strip()
+                for t in llm.chat_batch(questions, lora_path=lora_path)
+            ]
         except Exception as e:
             last_err = e
             if attempt >= retries:
                 break
             time.sleep(sleep_s)
     raise RuntimeError(f"LLM 调用失败: {last_err!r}")
+
+
+def _evaluate_pass_bon(
+    pass1_code: str,
+    bon_codes: List[str],
+    inputs: List[str],
+    outputs: List[str],
+    *,
+    timeout: int,
+) -> Dict[str, Any]:
+    run_kw = {"timeout": timeout}
+    pass_at_1 = utils.solver_passes_all_cases(
+        pass1_code,
+        inputs,
+        outputs,
+        **run_kw,
+    )
+    bon_pass = utils.solver_pass_at_1(
+        bon_codes,
+        inputs,
+        outputs,
+        **run_kw,
+    )
+    bon_passed_candidate: Optional[int] = None
+    for i, code in enumerate(bon_codes):
+        if utils.solver_passes_all_cases(code, inputs, outputs, **run_kw):
+            bon_passed_candidate = i
+            break
+
+    eval_result = _evaluate_code(pass1_code, inputs, outputs, timeout=timeout)
+    return {
+        "pass_at_1": pass_at_1,
+        "bon_pass": bon_pass,
+        "bon_n": len(bon_codes),
+        "bon_passed_candidate": bon_passed_candidate,
+        "passed": pass_at_1,
+        "eval_result": eval_result,
+    }
+
+
+def _write_passed_lists(result_dir: Path, results: List[Dict[str, Any]]) -> None:
+    pass1_lines = [
+        f"{r.get('idx')}\t{r.get('id')}"
+        for r in results
+        if r.get("pass_at_1")
+    ]
+    bon_lines = [
+        f"{r.get('idx')}\t{r.get('id')}"
+        for r in results
+        if r.get("bon_pass")
+    ]
+    (result_dir / "passed_pass1.txt").write_text(
+        "\n".join(pass1_lines) + ("\n" if pass1_lines else ""),
+        encoding="utf-8",
+    )
+    (result_dir / "passed_bon.txt").write_text(
+        "\n".join(bon_lines) + ("\n" if bon_lines else ""),
+        encoding="utf-8",
+    )
 
 
 def _write_json(path: Path, obj: Dict[str, Any]) -> None:
@@ -354,13 +556,14 @@ def main() -> int:
         _apply_gpu_env(args.gpu)
 
     ds = _load_dataset(args)
+    lora_path = _resolve_lora_path(args)
     result_dir = _resolve_result_dir(args)
     result_dir.mkdir(parents=True, exist_ok=True)
 
     system_prompt = utils.file2text(args.prompt_file)
     llm: Optional[LLM] = None
     if not args.score_only:
-        llm = _build_llm(args, system_prompt)
+        llm = _build_llm(args, system_prompt, lora_path=lora_path)
 
     n_total = len(ds.df) if hasattr(ds, "df") else 0
     end = args.end if args.end is not None else n_total
@@ -372,6 +575,10 @@ def main() -> int:
     failed = 0
     skipped = 0
     no_cases = 0
+    pass_at_1_n = 0
+    bon_pass_n = 0
+    bon_n = max(0, int(args.solver_bestofn))
+    pass_bon_mode = _use_pass_bon_mode(args)
 
     iterator = indices
     if tqdm is not None:
@@ -383,7 +590,10 @@ def main() -> int:
         "dataset_path": args.dataset_path or default_dataset_path(args.dataset),
         "model": args.model,
         "model_type": args.model_type,
+        "lora": lora_path or "",
         "score_only": args.score_only,
+        "solver_bestofn": bon_n,
+        "pass_bon_mode": pass_bon_mode,
         "start": args.start,
         "end": end,
         "results": [],
@@ -395,11 +605,26 @@ def main() -> int:
         pid = _problem_id(ds, idx)
         code_path, meta_path, err_path, raw_path = _result_paths(result_dir, pid)
 
-        if args.resume and _is_done(meta_path, code_path):
+        if args.resume and _is_done(
+            meta_path,
+            code_path,
+            bon_n=bon_n if pass_bon_mode else 0,
+            result_dir=result_dir,
+            pid=pid,
+        ):
             skipped += 1
             try:
                 old = json.loads(meta_path.read_text(encoding="utf-8"))
-                if old.get("passed"):
+                if pass_bon_mode:
+                    if old.get("pass_at_1"):
+                        pass_at_1_n += 1
+                    if old.get("bon_pass"):
+                        bon_pass_n += 1
+                    if old.get("passed"):
+                        passed += 1
+                    else:
+                        failed += 1
+                elif old.get("passed"):
                     passed += 1
                 else:
                     failed += 1
@@ -446,7 +671,129 @@ def main() -> int:
 
         raw_response = ""
         code = ""
+        bon_codes: List[str] = []
         llm_error = ""
+
+        if pass_bon_mode:
+            if args.score_only:
+                if not code_path.is_file():
+                    skipped += 1
+                    continue
+                code = code_path.read_text(encoding="utf-8")
+                for k in range(bon_n):
+                    bon_path = _bon_code_path(result_dir, pid, k)
+                    if not bon_path.is_file():
+                        skipped += 1
+                        code = ""
+                        break
+                    bon_codes.append(bon_path.read_text(encoding="utf-8"))
+                if not code or len(bon_codes) != bon_n:
+                    continue
+            else:
+                assert llm is not None
+                try:
+                    bon_raw = _chat_batch_with_retry(
+                        llm,
+                        [question] * bon_n,
+                        retries=args.retry,
+                        sleep_s=args.retry_sleep,
+                        lora_path=lora_path,
+                    )
+                    bon_codes = [utils.clean_code(t) for t in bon_raw]
+                    for k, bon_code in enumerate(bon_codes):
+                        _bon_code_path(result_dir, pid, k).write_text(
+                            bon_code,
+                            encoding="utf-8",
+                        )
+
+                    raw_response = _chat_with_retry(
+                        llm,
+                        question,
+                        retries=args.retry,
+                        sleep_s=args.retry_sleep,
+                        lora_path=lora_path,
+                    )
+                    code = utils.clean_code(raw_response)
+                    code_path.write_text(code, encoding="utf-8")
+                    if args.debug and raw_response:
+                        raw_path.write_text(raw_response, encoding="utf-8")
+                    if err_path.is_file():
+                        err_path.unlink()
+                except Exception as e:
+                    llm_error = repr(e)
+                    err_path.write_text(llm_error, encoding="utf-8")
+                    rec = {
+                        "idx": idx,
+                        "id": pid,
+                        "passed": False,
+                        "pass_at_1": False,
+                        "bon_pass": False,
+                        "reason": "llm_error",
+                        "error": llm_error,
+                    }
+                    _write_json(meta_path, rec)
+                    failed += 1
+                    reason_counts["llm_error"] = reason_counts.get("llm_error", 0) + 1
+                    summary["results"].append(rec)
+                    if args.debug:
+                        print(f"\n[debug] idx={idx} id={pid} reason=llm_error", flush=True)
+                        print(f"  error={llm_error}", flush=True)
+                    continue
+
+            metrics = _evaluate_pass_bon(
+                code,
+                bon_codes,
+                inputs,
+                outputs,
+                timeout=args.timeout,
+            )
+            eval_result = metrics["eval_result"]
+            rec = {
+                "idx": idx,
+                "id": pid,
+                "passed": bool(metrics["pass_at_1"]),
+                "pass_at_1": bool(metrics["pass_at_1"]),
+                "bon_pass": bool(metrics["bon_pass"]),
+                "bon_n": metrics["bon_n"],
+                "bon_passed_candidate": metrics["bon_passed_candidate"],
+                "reason": eval_result.get("reason"),
+                "total_cases": eval_result.get("total_cases", 0),
+                "passed_cases": eval_result.get("passed_cases", 0),
+                "failed_case": eval_result.get("failed_case"),
+                "code_path": str(code_path),
+                "question_len": len(question),
+                "raw_response_len": len(raw_response),
+            }
+            reason = str(eval_result.get("reason") or "unknown")
+            if not metrics["pass_at_1"]:
+                rec.update(
+                    _failure_debug_fields(
+                        raw_response=raw_response,
+                        code=code,
+                        inputs=inputs,
+                        outputs=outputs,
+                        eval_result=eval_result,
+                    )
+                )
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                if args.debug:
+                    _debug_print_failure(
+                        idx=idx,
+                        pid=pid,
+                        reason=reason,
+                        debug=rec,
+                    )
+            _write_json(meta_path, rec)
+            summary["results"].append(rec)
+
+            if metrics["pass_at_1"]:
+                pass_at_1_n += 1
+                passed += 1
+            else:
+                failed += 1
+            if metrics["bon_pass"]:
+                bon_pass_n += 1
+            continue
 
         if args.score_only:
             if not code_path.is_file():
@@ -461,6 +808,7 @@ def main() -> int:
                     question,
                     retries=args.retry,
                     sleep_s=args.retry_sleep,
+                    lora_path=lora_path,
                 )
                 code = utils.clean_code(raw_response)
                 code_path.write_text(code, encoding="utf-8")
@@ -534,6 +882,8 @@ def main() -> int:
 
     evaluated = passed + failed
     acc = (passed / evaluated) if evaluated else 0.0
+    pass_at_1_rate = (pass_at_1_n / evaluated) if evaluated and pass_bon_mode else acc
+    bon_pass_rate = (bon_pass_n / evaluated) if evaluated and pass_bon_mode else 0.0
     summary.update(
         {
             "passed": passed,
@@ -542,10 +892,16 @@ def main() -> int:
             "no_cases": no_cases,
             "evaluated": evaluated,
             "pass_rate": acc,
+            "pass_at_1_n": pass_at_1_n if pass_bon_mode else passed,
+            "pass_at_1_rate": pass_at_1_rate,
+            "bon_pass_n": bon_pass_n if pass_bon_mode else 0,
+            "bon_pass_rate": bon_pass_rate,
             "result_dir": str(result_dir),
             "reason_counts": reason_counts,
         }
     )
+    if pass_bon_mode:
+        _write_passed_lists(result_dir, summary["results"])
     _write_json(report_path, summary)
 
     print(
@@ -553,6 +909,13 @@ def main() -> int:
         f"passed={passed} failed={failed} skipped={skipped} "
         f"no_cases={no_cases} pass_rate={acc:.2%}"
     )
+    if pass_bon_mode:
+        print(
+            f"[pass@1] {pass_at_1_n}/{evaluated} = {pass_at_1_rate:.2%}  "
+            f"[BoN n={bon_n}] {bon_pass_n}/{evaluated} = {bon_pass_rate:.2%}"
+        )
+        print(f"[passed_pass1] {result_dir / 'passed_pass1.txt'}")
+        print(f"[passed_bon]   {result_dir / 'passed_bon.txt'}")
     if reason_counts:
         parts = ", ".join(f"{k}={v}" for k, v in sorted(reason_counts.items()))
         print(f"[reasons] {parts}")

@@ -43,6 +43,7 @@ class Model:
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
         gradient_checkpointing: bool = False,
+        solver_lora_init: str = "",
         exec_kwargs=None,
         chat_backend: str = "hf",
         vllm_tp_size: int = 2,
@@ -61,6 +62,7 @@ class Model:
         self._prompt_solver = utils.file2text("prompt/solver.txt")
         self._use_lora = bool(use_lora)
         self._lora_r = int(lora_r)
+        self._solver_lora_init = (solver_lora_init or "").strip()
         self._solver_lora_path: Optional[str] = None
         self._solver_lora_int_id: int = 1
         self._naive_lora_path: Optional[str] = None
@@ -85,6 +87,7 @@ class Model:
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 gradient_checkpointing=gradient_checkpointing,
+                solver_lora_init=self._solver_lora_init,
             )
         elif self.chat_backend == "hf":
             self._init_hf_backend(
@@ -96,6 +99,7 @@ class Model:
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 gradient_checkpointing=gradient_checkpointing,
+                solver_lora_init=self._solver_lora_init,
             )
         else:
             raise ValueError(f"未知 chat_backend: {chat_backend!r}，可选 hf / vllm")
@@ -130,6 +134,7 @@ class Model:
         lora_alpha,
         lora_dropout,
         gradient_checkpointing,
+        solver_lora_init: str = "",
     ):
         """单实例 vLLM 批量推理；naive/solver 训练用 HF Agent（各一张卡）。"""
         naive_dev, solver_dev = self._parse_train_devices(devices)
@@ -182,13 +187,17 @@ class Model:
             use_lora=use_lora,
             **agent_kw,
         )
+        solver_lora = (solver_lora_init or "").strip()
+        if solver_lora:
+            logger.info("solver 加载 SFT 冷启动 LoRA: %s", solver_lora)
         self.solver = Agent(
             model_path=model_path_train,
             system_prompt=self._prompt_solver,
             device=solver_dev,
             lr=lr,
             trainable=True,
-            use_lora=use_lora,
+            use_lora=use_lora or bool(solver_lora),
+            lora_path=solver_lora,
             **agent_kw,
         )
 
@@ -203,6 +212,7 @@ class Model:
         lora_alpha,
         lora_dropout,
         gradient_checkpointing,
+        solver_lora_init: str = "",
     ):
         if devices is None:
             devices = ("cuda:0", "cuda:1", "cuda:2")
@@ -243,13 +253,17 @@ class Model:
             use_lora=use_lora,
             **lora_kwargs,
         )
+        solver_lora = (solver_lora_init or "").strip()
+        if solver_lora:
+            logger.info("solver 加载 SFT 冷启动 LoRA: %s", solver_lora)
         self.solver = Agent(
             model_path=model_path,
             system_prompt=self._prompt_solver,
             device=solver_dev,
             lr=lr,
             trainable=True,
-            use_lora=use_lora,
+            use_lora=use_lora or bool(solver_lora),
+            lora_path=solver_lora,
             **lora_kwargs,
         )
 

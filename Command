@@ -84,44 +84,6 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
   --val_every 25 \
   --val_seed 42
 
-# 测例：auto=有官方 input_output 用 GT，否则 input_trigger（vLLM）生成
-# 验证集：启动时从 APPS 抽 300 题（有 input_output）→ output_dir/val_indices.json
-# 验证：开局 update_step=0 基线；之后每 25 次真正 update 验证一次
-
-# 执行测例说明：
-#   --exec_timeout 30      单次子进程最多 30s（默认 10，慢题可加大）
-#   --inject_mode half     超时后缩小 random 上界再试（naive 暴力常见）
-#   --no_inject_backoff    调试：超时直接失败，不打「注入退避」、不 retry
-
-# CodeContestPlus（改 dataset 即可）
-# CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python model/train.py \
-#   --dataset codecontestplus \
-#   --dataset_path ~/lzh/datasets/codecontestplus \
-#   --chat_backend vllm --vllm_tp_size 4 --devices cuda:6 --use_lora ...
-
-# 回退三卡全 HF（无 vLLM）：
-# CUDA_VISIBLE_DEVICES=0,1,2 python model/train.py \
-#   --chat_backend hf --devices cuda:0,cuda:1,cuda:2 --use_lora ...
-
-# 单独起 vLLM API 服务（评测/脚本用，非 train.py 必需）：
-# CUDA_VISIBLE_DEVICES=0 vllm serve ~/lzh/Qwen2.5-Coder-7B-Instruct \
-#   --port 8000 --served-model-name Qwen2.5-Coder-7B-Instruct
-
-# ---------- APPS/test pass@1（两个 tmux 前台跑，无注入退避）----------
-# 流程：生成1份代码 → APPS/test 官方 input 跑 → 对官方 output，全过=pass@1
-cd ~/lzh/apr
-
-# 若旧 bash 脚本还占卡，先清理：
-python model/kill_pass1_gpu.py
-# 或手动：kill 4055693 4055698   # 换成 ps/nvidia-smi 里看到的 PID
-
-# tmux 窗口1（卡5，Qwen2.5-Coder naive+solver）
-python model/run_pass1_gpu5_qwen25.py
-
-# tmux 窗口2（卡6，Qwen3-8b naive+solver）
-python model/run_pass1_gpu6_qwen3.py
-
-# 汇总: outputs/pass1_eval/*_summary.json
 
 # ---------- LoRA only_solver pass@1（先合并，再 vLLM）----------
 # 1) 仅合并（约 5-10 分钟，额外 ~15GB → outputs/only_solver/merged_model）
@@ -156,35 +118,61 @@ python model/infer_reasoning.py \
 # 9644 题，约 1～2 分钟（本地 SSD）
 
 # CodeContests 全量训练（物理卡 3,4,5,6：vLLM tp=2 占 cuda:0,1，solver 训 cuda:2）
-CUDA_VISIBLE_DEVICES=1,2,3 python model/train.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
   --dataset apps \
-  --dataset_path ~/lzh/datasets/APPS/train\
+  --dataset_path ~/lzh/datasets/APPS/train \
   --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
   --chat_backend vllm \
   --vllm_tp_size 2 \
-  --devices cuda:2 \
+  --devices cuda:2,cuda:3 \
   --use_lora \
   --gradient_checkpointing \
   --inject_mode half \
   --inject_value 10 \
-  --exec_timeout 10 \
-  --exec_workers 40 \
-  --output_dir outputs/solver_rl_apps \
-  --naive_bestofn 16 \
-  --solver_bestofn 16 \
+  --exec_timeout 30 \
+  --exec_workers 8 \
+  --output_dir outputs/naive_solver_rl \
+  --naive_bestofn 3 \
+  --solver_bestofn 3 \
   --input_count 10 \
   --input_source auto \
-  --start 0 --end 9644 \
+  --start 0 --end 5000 \
   --epochs 1 \
-  --save_every 500 \
-  --val_size 100 \
-  --val_every 500 \
+  --save_every 50 \
+  --val_size 300 \
+  --val_every 25 \
   --val_seed 42
-
 # CodeContests 全量 pass@1（物理卡 3,4,5,6，vLLM tp=4）
 # python model/kill_pass1_gpu.py   # 若旧进程占卡先清理
 # python model/run_pass1_codecontests_gpu3456.py
 # 结果: outputs/pass1_eval_codecontests/*_summary.json
+
+# ---------- CURE_codecontests 训练（train split 4529 题，json 直读免解压）----------
+# 数据：~/datasets/CURE_codecontests/{train,test}/
+# rollout 测例=test_input（隐藏测例），Public Test=example_input（题干样例）
+CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
+  --dataset cure_codecontests \
+  --dataset_path ~/datasets/CURE_codecontests \
+  --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --chat_backend vllm \
+  --vllm_tp_size 2 \
+  --devices cuda:2,cuda:3 \
+  --use_lora \
+  --gradient_checkpointing \
+  --inject_mode half \
+  --inject_value 10 \
+  --exec_timeout 30 \
+  --exec_workers 8 \
+  --output_dir outputs/naive_solver_rl_cure_cc \
+  --naive_bestofn 16 \
+  --solver_bestofn 16 \
+  --input_count 10 \
+  --input_source input_output \
+  --epochs 1 \
+  --save_every 50 \
+  --val_size 300 \
+  --val_every 25 \
+  --val_seed 42
 
 # ---------- alldatasets 统一评测（物理卡 1）----------
 # 数据：~/lzh/datasets/{LiveCodeBench,codeforces}/test/
@@ -208,3 +196,132 @@ python alldatasets/eval.py \
   --gpu 1 \
   --tensor-parallel-size 1 \
   --resume
+
+# CodeContests train 全量 pass@1 + BoN（tests/test_data.json 打分）
+python alldatasets/eval.py \
+  --dataset codecontests \
+  --dataset-path ~/lzh/datasets/codecontests/extracted_tasks \
+  --model-type local \
+  --model "$MODEL" \
+  --solver-bestofn 16 \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+# 结果: results/eval_codecontests_local_Qwen2.5-Coder-7B-Instruct/
+#   passed_pass1.txt / passed_bon.txt / eval_report.json
+
+# ---------- LoRA checkpoint 评测（基座 + adapter，免合并）----------
+CKPT=~/lzh/apr/outputs/naive_solver_rl_cc_tests
+
+# LiveCodeBench（solver LoRA）
+python alldatasets/eval.py \
+  --dataset livecodebench \
+  --model-type local \
+  --model "$MODEL" \
+  --lora "$CKPT/final" \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+
+# CodeForces（solver LoRA）
+python alldatasets/eval.py \
+  --dataset codeforces \
+  --model-type local \
+  --model "$MODEL" \
+  --lora "$CKPT/final" \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+
+# naive LoRA: --lora "$CKPT/final/naive" --prompt-file prompt/naivesolver.txt
+# 中间 step: --lora "$CKPT/step_500"
+# 训练 lora_r > 64 时需加 --max-lora-rank <r>
+# 结果目录自动带 lora 后缀: results/eval_<ds>_local_<model>_lora_naive_solver_rl_cc_tests_final/
+
+# ---------- CURE_codecontests 评测（test split 239 题，默认 test_input 打分）----------
+# 基座 pass@1 + BoN
+python alldatasets/eval.py \
+  --dataset cure_codecontests \
+  --dataset-path ~/datasets/CURE_codecontests \
+  --model-type local \
+  --model "$MODEL" \
+  --solver-bestofn 16 \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+
+# LoRA checkpoint
+python alldatasets/eval.py \
+  --dataset cure_codecontests \
+  --dataset-path ~/datasets/CURE_codecontests \
+  --model-type local \
+  --model "$MODEL" \
+  --lora "$CKPT/final" \
+  --gpu 1 \
+  --tensor-parallel-size 1 \
+  --resume
+# --split train 可评 train split；--use-public-only 只用题干样例打分
+# 结果: results/eval_cure_codecontests_local_<model>_test/
+￼
+
+
+
+给我命令
+
+Explored
+2 files
+物理卡 4、5、6、7（naive+solver 双训，4 卡方案）：
+
+cd ~/lzh/apr
+CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
+  --dataset apps \
+  --dataset_path ~/lzh/datasets/APPS/train \
+  --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --chat_backend vllm \
+  --vllm_tp_size 2 \
+  --devices cuda:2,cuda:3 \
+  --use_lora \
+  --gradient_checkpointing \
+  --inject_mode half \
+  --inject_value 10 \
+  --exec_timeout 30 \
+  --exec_workers 8 \
+  --output_dir outputs/naive_solver_rl \
+  --naive_bestofn 3 \
+  --solver_bestofn 3 \
+  --input_count 10 \
+  --input_source auto \
+  --start 0 --end 5000 \
+  --epochs 1 \
+  --save_every 50 \
+  --val_size 300 \
+  --val_every 25 \
+  --val_seed 42
+  --tensor-parallel-size 1 \
+  --resume
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
+  --dataset codecontests \
+  --dataset_path /home/liuzhihao/datasets/codecontests/extracted_tasks \
+  --dataset_io_source sample \
+  --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
+  --chat_backend vllm \
+  --vllm_tp_size 2 \
+  --devices cuda:2,cuda:3 \
+  --use_lora \
+  --gradient_checkpointing \
+  --inject_mode half \
+  --inject_value 10 \
+  --exec_timeout 30 \
+  --exec_workers 8 \
+  --input_source trigger \
+  --input_count 10 \
+  --output_dir outputs/naive_solver_rl_cc_trigger \
+  --naive_bestofn 3 \
+  --solver_bestofn 3 \
+  --start 0 --end 1 \
+  --epochs 1 \
+  --save_every 500 \
+  --val_size 100 \
+  --val_every 500 \
+  --val_seed 42

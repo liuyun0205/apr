@@ -256,7 +256,7 @@ class MultiTrainer:
         - S_{i,j} = Σ_k M_{i,k,j} / max_r Σ_k M_{r,k,j}
         - w = (#通过 Public Test 的 Naive) / N_n，c = 2w - 1
         - A_i = 1[solver_i 通过 Public Test]
-        """
+        """ 
         if not all_matrices:
             return []
 

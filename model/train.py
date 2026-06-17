@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="codecontestplus",
-        choices=["codecontestplus", "apps", "codecontests"],
+        choices=["codecontestplus", "apps", "codecontests", "cure_codecontests"],
         help="训练数据集类型",
     )
     parser.add_argument(
@@ -134,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         "--use_lora",
         action="store_true",
         help="对 naive/solver 启用 LoRA 训练（推荐，显存占用更小）",
+    )
+    parser.add_argument(
+        "--solver_lora_init",
+        type=str,
+        default="",
+        help="SFT 冷启动 solver LoRA 目录（model/sft_solver.py 产出，含 adapter_config.json）",
     )
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=128)
@@ -219,14 +225,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="tests",
         choices=["sample", "tests"],
-        help="codecontests rollout 测例：tests=test_data.json；sample=题干 Example",
+        help="codecontests/cure_codecontests rollout 测例："
+        "tests=隐藏测例；sample=题干 Example",
     )
     parser.add_argument(
         "--dataset_public_io_source",
         type=str,
         default="sample",
         choices=["sample", "tests"],
-        help="codecontests 验证/Public Test：sample=题干 Example",
+        help="codecontests/cure_codecontests 验证/Public Test：sample=题干 Example",
     )
     parser.add_argument(
         "--val_size",
@@ -262,6 +269,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="验证时每题测例数；0=与 --input_count 相同",
+    )
+    parser.add_argument(
+        "--rollout_cache_dir",
+        type=str,
+        default="",
+        help=(
+            "rollout 缓存目录；非空时每题首次 rollout（codes/inputs/matrices/"
+            "public_pass）会存为 JSON，重训时直接加载跳过生成与执行。"
+            "注意：缓存来自旧策略，模型更新后属于 off-policy 数据"
+        ),
     )
     return parser.parse_args()
 
@@ -367,23 +384,58 @@ def _exec_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def one_step(
+def _rollout_cache_path(cache_dir: str, idx: int, problem_id: str) -> Path:
+    safe_id = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_" for ch in str(problem_id)
+    )
+    name = f"{idx}_{safe_id}.json" if safe_id else f"{idx}.json"
+    return Path(cache_dir).expanduser() / name
+
+
+def _load_rollout_cache(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logging.warning("rollout 缓存损坏，忽略并重新 rollout: %s (%s)", path, e)
+        return None
+    required = (
+        "solver_codes",
+        "naive_codes",
+        "inputs",
+        "all_matrices",
+        "solver_public_pass",
+        "naive_public_pass",
+    )
+    if not isinstance(data, dict) or any(k not in data for k in required):
+        logging.warning("rollout 缓存字段缺失，忽略: %s", path)
+        return None
+    return data
+
+
+def _save_rollout_cache(path: Path, data: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        logging.warning("rollout 缓存写入失败: %s (%s)", path, e)
+
+
+def _rollout_one(
     model: Any,
     trainer: MultiTrainer,
     question: str,
     *,
     idx: int,
-    problem_id: str = "",
-    global_step: int = 0,
     naive_bestofn: int,
     solver_bestofn: int,
     input_count: int,
-    min_reward: float,
-    reward_beta: float = 0.3,
-    reward_alpha: float = 0.3,
     exec_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """单题训练一步：rollout（vLLM+LoRA / HF+LoRA）-> 打分 -> HF 更新 LoRA。"""
+    """rollout + 打分矩阵 + Public Test 评测（不更新参数）。"""
     lora_synced = False
     if (
         getattr(model, "chat_backend", "") == "vllm"
@@ -425,70 +477,155 @@ def one_step(
             public_outputs,
             exec_kwargs=run_kw,
         )
-        solver_rewards = trainer.calc_solver_rewards(
-            matrices,
-            solver_public_pass,
-            naive_public_pass,
-            beta=reward_beta,
-        )
-        naive_rewards = trainer.calc_naive_rewards(
-            matrices,
-            naive_public_pass,
-            alpha=reward_alpha,
-        )
-        solver_prompt = model.solver.build_prompt(question)
-        naive_prompt = model.naivesolver.build_prompt(question)
-
-        losses: List[float] = []
-        updated = 0
-        for code, reward in zip(candidates["solver_codes"], solver_rewards):
-            if reward <= min_reward:
-                continue
-            code = utils.clean_code(code)
-            if not code.strip():
-                continue
-            loss = trainer.update_agent(
-                model.solver,
-                solver_prompt,
-                code,
-                reward,
-            )
-            losses.append(loss)
-            updated += 1
-
-        naive_losses: List[float] = []
-        naive_updated = 0
-        for code, reward in zip(candidates["naive_codes"], naive_rewards):
-            if reward <= min_reward:
-                continue
-            code = utils.clean_code(code)
-            if not code.strip():
-                continue
-            loss = trainer.update_agent(
-                model.naivesolver,
-                naive_prompt,
-                code,
-                reward,
-            )
-            naive_losses.append(loss)
-            naive_updated += 1
-
         return {
             "skipped": False,
-            "num_inputs": len(inputs),
+            "solver_codes": candidates["solver_codes"],
+            "naive_codes": candidates["naive_codes"],
+            "inputs": inputs,
+            "all_matrices": matrices,
+            "solver_public_pass": solver_public_pass,
+            "naive_public_pass": naive_public_pass,
             "input_source": candidates.get("input_source"),
             "solver_gen_backend": solver_gen,
             "naive_gen_backend": naive_gen,
-            "rewards": solver_rewards,
-            "naive_rewards": naive_rewards,
-            "losses": losses,
-            "naive_losses": naive_losses,
-            "updated": updated,
-            "naive_updated": naive_updated,
         }
     finally:
         if lora_synced:
             model.clear_rollout_lora_snapshots()
+
+
+def one_step(
+    model: Any,
+    trainer: MultiTrainer,
+    question: str,
+    *,
+    idx: int,
+    problem_id: str = "",
+    global_step: int = 0,
+    naive_bestofn: int,
+    solver_bestofn: int,
+    input_count: int,
+    min_reward: float,
+    reward_beta: float = 0.3,
+    reward_alpha: float = 0.3,
+    exec_kwargs: Optional[Dict[str, Any]] = None,
+    rollout_cache_dir: str = "",
+) -> Dict[str, Any]:
+    """单题训练一步：rollout（vLLM+LoRA / HF+LoRA 或缓存）-> 打分 -> HF 更新 LoRA。"""
+    rollout: Optional[Dict[str, Any]] = None
+    from_cache = False
+    cache_path: Optional[Path] = None
+
+    if rollout_cache_dir:
+        cache_path = _rollout_cache_path(rollout_cache_dir, idx, problem_id)
+        cached = _load_rollout_cache(cache_path)
+        if cached is not None:
+            rollout = cached
+            from_cache = True
+
+    if rollout is None:
+        rollout = _rollout_one(
+            model,
+            trainer,
+            question,
+            idx=idx,
+            naive_bestofn=naive_bestofn,
+            solver_bestofn=solver_bestofn,
+            input_count=input_count,
+            exec_kwargs=exec_kwargs,
+        )
+        if rollout.get("skipped"):
+            return rollout
+        if cache_path is not None:
+            _save_rollout_cache(
+                cache_path,
+                {
+                    "solver_codes": rollout["solver_codes"],
+                    "naive_codes": rollout["naive_codes"],
+                    "inputs": rollout["inputs"],
+                    "all_matrices": rollout["all_matrices"],
+                    "solver_public_pass": rollout["solver_public_pass"],
+                    "naive_public_pass": rollout["naive_public_pass"],
+                    "problem_id": str(problem_id),
+                    "question": question,
+                    "input_source": rollout.get("input_source"),
+                },
+            )
+
+    solver_codes = rollout["solver_codes"]
+    naive_codes = rollout["naive_codes"]
+    inputs = rollout["inputs"]
+    matrices = rollout["all_matrices"]
+    solver_public_pass = rollout["solver_public_pass"]
+    naive_public_pass = rollout["naive_public_pass"]
+
+    if not inputs:
+        return {"skipped": True, "reason": "no_inputs"}
+    if not matrices or not matrices[0]:
+        return {"skipped": True, "reason": "empty_matrices"}
+
+    solver_rewards = trainer.calc_solver_rewards(
+        matrices,
+        solver_public_pass,
+        naive_public_pass,
+        beta=reward_beta,
+    )
+    naive_rewards = trainer.calc_naive_rewards(
+        matrices,
+        naive_public_pass,
+        alpha=reward_alpha,
+    )
+    solver_prompt = model.solver.build_prompt(question)
+    naive_prompt = model.naivesolver.build_prompt(question)
+
+    losses: List[float] = []
+    updated = 0
+    for code, reward in zip(solver_codes, solver_rewards):
+        if reward <= min_reward:
+            continue
+        code = utils.clean_code(code)
+        if not code.strip():
+            continue
+        loss = trainer.update_agent(
+            model.solver,
+            solver_prompt,
+            code,
+            reward,
+        )
+        losses.append(loss)
+        updated += 1
+
+    naive_losses: List[float] = []
+    naive_updated = 0
+    for code, reward in zip(naive_codes, naive_rewards):
+        if reward <= min_reward:
+            continue
+        code = utils.clean_code(code)
+        if not code.strip():
+            continue
+        loss = trainer.update_agent(
+            model.naivesolver,
+            naive_prompt,
+            code,
+            reward,
+        )
+        naive_losses.append(loss)
+        naive_updated += 1
+
+    return {
+        "skipped": False,
+        "num_inputs": len(inputs),
+        "input_source": rollout.get("input_source"),
+        "rollout_from_cache": from_cache,
+        "solver_gen_backend": rollout.get("solver_gen_backend") or "cache",
+        "naive_gen_backend": rollout.get("naive_gen_backend") or "cache",
+        "rewards": solver_rewards,
+        "naive_rewards": naive_rewards,
+        "losses": losses,
+        "naive_losses": naive_losses,
+        "updated": updated,
+        "naive_updated": naive_updated,
+    }
 
 
 def eval_one(
@@ -834,6 +971,14 @@ def resolve_dataset_path(args: argparse.Namespace) -> str:
 
         base = Path("~/datasets/codecontests").expanduser()
         return _resolve_codecontests_path(str(base))
+    if args.dataset == "cure_codecontests":
+        from alldatasets.loader import default_dataset_path
+
+        return default_dataset_path("cure_codecontests")
+    if args.dataset == "codecontestplus":
+        from alldatasets.loader import default_dataset_path
+
+        return default_dataset_path("codecontestplus")
     return "~/lzh/datasets/codecontestplus"
 
 
@@ -914,6 +1059,7 @@ def train_loop(
                 reward_beta=args.reward_beta,
                 reward_alpha=args.reward_alpha,
                 exec_kwargs=_exec_kwargs(args),
+                rollout_cache_dir=args.rollout_cache_dir,
             )
             global_step += 1
 
@@ -1039,6 +1185,10 @@ def main() -> None:
     if args.dataset == "codecontests":
         ds_kwargs["rollout_io_source"] = args.dataset_rollout_io_source
         ds_kwargs["public_io_source"] = args.dataset_public_io_source
+    if args.dataset == "cure_codecontests":
+        ds_kwargs["split"] = "train"
+        ds_kwargs["rollout_io_source"] = args.dataset_rollout_io_source
+        ds_kwargs["public_io_source"] = args.dataset_public_io_source
     dataset = load_dataset(args.dataset, dataset_path, **ds_kwargs)
 
     if args.debug:
@@ -1072,6 +1222,10 @@ def main() -> None:
     else:
         exec_kwargs = _exec_kwargs(args)
 
+    solver_lora_init = (args.solver_lora_init or "").strip()
+    if solver_lora_init and not args.use_lora:
+        raise ValueError("--solver_lora_init 需要同时指定 --use_lora")
+
     model = Model(
         dataset,
         model_path=args.model_path,
@@ -1082,6 +1236,7 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         gradient_checkpointing=args.gradient_checkpointing,
+        solver_lora_init=solver_lora_init,
         exec_kwargs=exec_kwargs,
         chat_backend=args.chat_backend,
         vllm_tp_size=vllm_tp,
