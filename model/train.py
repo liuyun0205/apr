@@ -71,7 +71,7 @@ def resolve_vllm_tp(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="多智能体 reward 训练：input_trigger + naivesolver + solver"
+        description="多智能体 PPO 训练：input_trigger + naivesolver + solver"
     )
     parser.add_argument(
         "--dataset",
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default="outputs/solver_rl")
     parser.add_argument("--naive_bestofn", type=int, default=3)
     parser.add_argument("--solver_bestofn", type=int, default=3)
-    parser.add_argument("--input_count", type=int, default=10)
+    parser.add_argument("--input_count", type=int, default=8)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=1)
@@ -115,13 +115,37 @@ def parse_args() -> argparse.Namespace:
         "--reward_beta",
         type=float,
         default=0.3,
-        help="solver reward：R_s = (1/m)Σ[S_ij + β·c·A_i]，默认 β=0.3",
+        help="solver reward：R_s = α·G + β·Δ_A·A，默认 β=0.3",
     )
     parser.add_argument(
         "--reward_alpha",
         type=float,
-        default=0.3,
-        help="naive reward：R_n = (1/m)Σ[C_kj + α·c·N_k]，默认 α=0.3",
+        default=1.0,
+        help="solver reward GT 项权重 α；naive reward 即 G（hidden GT 通过率）",
+    )
+    parser.add_argument(
+        "--ppo_epochs",
+        type=int,
+        default=4,
+        help="PPO 每样本重复更新轮数",
+    )
+    parser.add_argument(
+        "--ppo_clip_eps",
+        type=float,
+        default=0.2,
+        help="PPO clip 系数 ε",
+    )
+    parser.add_argument(
+        "--ppo_normalize_adv",
+        action="store_true",
+        default=True,
+        help="PPO 前对同题 batch reward 做标准化 advantage（默认开）",
+    )
+    parser.add_argument(
+        "--no_ppo_normalize_adv",
+        dest="ppo_normalize_adv",
+        action="store_false",
+        help="关闭 PPO advantage 标准化",
     )
     parser.add_argument("--save_every", type=int, default=50)
     parser.add_argument("--log_file", type=str, default="")
@@ -236,10 +260,28 @@ def parse_args() -> argparse.Namespace:
         help="codecontests/cure_codecontests 验证/Public Test：sample=题干 Example",
     )
     parser.add_argument(
+        "--val_dataset",
+        type=str,
+        default="livecodebench",
+        help="验证数据集：livecodebench（默认）或 same=与训练集同库 hold-out",
+    )
+    parser.add_argument(
+        "--val_dataset_path",
+        type=str,
+        default="",
+        help="验证集路径；为空时用 val_dataset 默认路径",
+    )
+    parser.add_argument(
+        "--val_gt_count",
+        type=int,
+        default=0,
+        help="验证 IGAR/GT 测例数；0=用该题全部测例（LiveCodeBench 推荐）",
+    )
+    parser.add_argument(
         "--val_size",
         type=int,
         default=300,
-        help="从 APPS 抽取验证集题数（需有 input_output）；0=关闭验证",
+        help="验证抽样题数（从 val_dataset 抽取）；0=关闭验证",
     )
     parser.add_argument(
         "--val_every",
@@ -405,6 +447,9 @@ def _load_rollout_cache(path: Path) -> Optional[Dict[str, Any]]:
         "naive_codes",
         "inputs",
         "all_matrices",
+        "solver_gt_match",
+        "gt_inputs",
+        "gt_outputs",
         "solver_public_pass",
         "naive_public_pass",
     )
@@ -465,10 +510,23 @@ def _rollout_one(
             return {"skipped": True, "reason": "no_inputs"}
 
         run_kw = exec_kwargs or {}
-        public_inputs, public_outputs = _load_public_test(model, idx)
+        public_inputs, public_outputs = _load_public_test(model.dataset, idx)
+        gt_inputs, gt_outputs = _load_gt_tests(model.dataset, idx, count=8)
+        if not gt_inputs or len(gt_inputs) != len(gt_outputs):
+            return {"skipped": True, "reason": "no_gt_tests"}
+        candidates["inputs"] = gt_inputs
         matrices = trainer.build_matrices(candidates, exec_kwargs=run_kw)
         if not matrices or not matrices[0]:
             return {"skipped": True, "reason": "empty_matrices"}
+
+        solver_gt_match = trainer.build_gt_match_matrix(
+            candidates["solver_codes"],
+            gt_inputs,
+            gt_outputs,
+            exec_kwargs=run_kw,
+        )
+        if not solver_gt_match:
+            return {"skipped": True, "reason": "empty_gt_match"}
 
         solver_public_pass, naive_public_pass = trainer.build_public_pass_flags(
             candidates["solver_codes"],
@@ -481,11 +539,14 @@ def _rollout_one(
             "skipped": False,
             "solver_codes": candidates["solver_codes"],
             "naive_codes": candidates["naive_codes"],
-            "inputs": inputs,
+            "inputs": gt_inputs,
+            "gt_inputs": gt_inputs,
+            "gt_outputs": gt_outputs,
             "all_matrices": matrices,
+            "solver_gt_match": solver_gt_match,
             "solver_public_pass": solver_public_pass,
             "naive_public_pass": naive_public_pass,
-            "input_source": candidates.get("input_source"),
+            "input_source": "cure_hidden_gt",
             "solver_gen_backend": solver_gen,
             "naive_gen_backend": naive_gen,
         }
@@ -506,12 +567,15 @@ def one_step(
     solver_bestofn: int,
     input_count: int,
     min_reward: float,
+    reward_alpha: float = 1.0,
     reward_beta: float = 0.3,
-    reward_alpha: float = 0.3,
+    ppo_epochs: int = 4,
+    ppo_clip_eps: float = 0.2,
+    ppo_normalize_adv: bool = True,
     exec_kwargs: Optional[Dict[str, Any]] = None,
     rollout_cache_dir: str = "",
 ) -> Dict[str, Any]:
-    """单题训练一步：rollout（vLLM+LoRA / HF+LoRA 或缓存）-> 打分 -> HF 更新 LoRA。"""
+    """单题训练一步：rollout -> 打分 -> PPO 更新 LoRA。"""
     rollout: Optional[Dict[str, Any]] = None
     from_cache = False
     cache_path: Optional[Path] = None
@@ -544,6 +608,9 @@ def one_step(
                     "naive_codes": rollout["naive_codes"],
                     "inputs": rollout["inputs"],
                     "all_matrices": rollout["all_matrices"],
+                    "solver_gt_match": rollout["solver_gt_match"],
+                    "gt_inputs": rollout["gt_inputs"],
+                    "gt_outputs": rollout["gt_outputs"],
                     "solver_public_pass": rollout["solver_public_pass"],
                     "naive_public_pass": rollout["naive_public_pass"],
                     "problem_id": str(problem_id),
@@ -556,6 +623,9 @@ def one_step(
     naive_codes = rollout["naive_codes"]
     inputs = rollout["inputs"]
     matrices = rollout["all_matrices"]
+    solver_gt_match = rollout["solver_gt_match"]
+    gt_inputs = rollout["gt_inputs"]
+    gt_outputs = rollout["gt_outputs"]
     solver_public_pass = rollout["solver_public_pass"]
     naive_public_pass = rollout["naive_public_pass"]
 
@@ -563,54 +633,45 @@ def one_step(
         return {"skipped": True, "reason": "no_inputs"}
     if not matrices or not matrices[0]:
         return {"skipped": True, "reason": "empty_matrices"}
+    if not solver_gt_match:
+        return {"skipped": True, "reason": "empty_gt_match"}
 
+    run_kw = exec_kwargs or {}
     solver_rewards = trainer.calc_solver_rewards(
         matrices,
-        solver_public_pass,
-        naive_public_pass,
+        solver_gt_match,
+        alpha=reward_alpha,
         beta=reward_beta,
     )
     naive_rewards = trainer.calc_naive_rewards(
-        matrices,
-        naive_public_pass,
-        alpha=reward_alpha,
+        naive_codes,
+        gt_inputs,
+        gt_outputs,
+        exec_kwargs=run_kw,
     )
     solver_prompt = model.solver.build_prompt(question)
     naive_prompt = model.naivesolver.build_prompt(question)
 
-    losses: List[float] = []
-    updated = 0
-    for code, reward in zip(solver_codes, solver_rewards):
-        if reward <= min_reward:
-            continue
-        code = utils.clean_code(code)
-        if not code.strip():
-            continue
-        loss = trainer.update_agent(
-            model.solver,
-            solver_prompt,
-            code,
-            reward,
-        )
-        losses.append(loss)
-        updated += 1
-
-    naive_losses: List[float] = []
-    naive_updated = 0
-    for code, reward in zip(naive_codes, naive_rewards):
-        if reward <= min_reward:
-            continue
-        code = utils.clean_code(code)
-        if not code.strip():
-            continue
-        loss = trainer.update_agent(
-            model.naivesolver,
-            naive_prompt,
-            code,
-            reward,
-        )
-        naive_losses.append(loss)
-        naive_updated += 1
+    losses, updated = trainer.ppo_update_role(
+        model.solver,
+        solver_prompt,
+        solver_codes,
+        solver_rewards,
+        min_reward=min_reward,
+        clip_eps=ppo_clip_eps,
+        ppo_epochs=ppo_epochs,
+        normalize_adv=ppo_normalize_adv,
+    )
+    naive_losses, naive_updated = trainer.ppo_update_role(
+        model.naivesolver,
+        naive_prompt,
+        naive_codes,
+        naive_rewards,
+        min_reward=min_reward,
+        clip_eps=ppo_clip_eps,
+        ppo_epochs=ppo_epochs,
+        normalize_adv=ppo_normalize_adv,
+    )
 
     return {
         "skipped": False,
@@ -634,75 +695,75 @@ def eval_one(
     question: str,
     *,
     idx: int,
-    naive_bestofn: int,
+    dataset: Any = None,
     solver_bestofn: int,
-    input_count: int,
-    reward_beta: float = 0.3,
+    reward_alpha: float = 1.0,
+    gt_count: int = 8,
+    eval_full_tests: bool = False,
     exec_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """单题验证：只打分，不更新参数；solver 用 LoRA（验证时 vLLM+LoRA 快照）。"""
-    candidates = model.generate_candidates(
-        naive_bestofn,
-        solver_bestofn,
-        question,
-        input_count=input_count,
-        idx=idx,
-        use_trainable_solver=True,
-        use_trainable_naive=True,
-    )
-    solver_gen = model.ensure_solver_not_base(context="验证")
-    model.ensure_naive_not_base(context="验证")
-    inputs = candidates.get("inputs") or []
-    if not inputs:
-        return {"skipped": True, "reason": "no_inputs", "mean_reward": 0.0}
+    """单题验证：仅 solver pass@1、BoN、GT 奖励（不生成 naive）。"""
+    eval_ds = dataset if dataset is not None else model.dataset
 
     run_kw = exec_kwargs or {}
-    public_inputs, public_outputs = _load_public_test(model, idx)
-    matrices = trainer.build_matrices(candidates, exec_kwargs=run_kw)
-    if not matrices or not matrices[0]:
-        return {"skipped": True, "reason": "empty_matrices", "mean_reward": 0.0}
+    gt_inputs, gt_outputs = _load_gt_tests(eval_ds, idx, count=gt_count)
+    if not gt_inputs or len(gt_inputs) != len(gt_outputs):
+        return {"skipped": True, "reason": "no_gt_tests", "mean_reward": 0.0}
 
-    solver_public_pass, naive_public_pass = trainer.build_public_pass_flags(
-        candidates["solver_codes"],
-        candidates["naive_codes"],
-        public_inputs,
-        public_outputs,
-        exec_kwargs=run_kw,
-    )
-    rewards = trainer.calc_solver_rewards(
-        matrices,
-        solver_public_pass,
-        naive_public_pass,
-        beta=reward_beta,
-    )
-    mean_r = sum(rewards) / len(rewards) if rewards else 0.0
+    if eval_full_tests:
+        pass_inputs, pass_outputs = gt_inputs, gt_outputs
+    else:
+        pass_inputs, pass_outputs = _load_public_test(eval_ds, idx)
+    if not pass_inputs or len(pass_inputs) != len(pass_outputs or []):
+        return {"skipped": True, "reason": "no_pass_tests", "mean_reward": 0.0}
 
-    bestofn_pass = False
-    if public_inputs and public_outputs:
-        bestofn_pass = utils.solver_pass_at_1(
-            candidates["solver_codes"],
-            public_inputs,
-            public_outputs,
+    solver_codes = model.generate_solver_codes(
+        question,
+        n=solver_bestofn,
+        use_trainable_solver=True,
+    )
+    solver_gen = model.ensure_solver_not_base(context="验证")
+    if not solver_codes:
+        return {"skipped": True, "reason": "no_solver_codes", "mean_reward": 0.0}
+
+    bestofn_pass = utils.solver_pass_at_1(
+        solver_codes,
+        pass_inputs,
+        pass_outputs,
+        **run_kw,
+    )
+
+    pass_at_1 = False
+    fresh_codes = model.generate_solver_codes(
+        question, n=1, use_trainable_solver=True
+    )
+    model.ensure_solver_not_base(context="验证 pass@1")
+    if fresh_codes:
+        pass_at_1 = utils.solver_passes_all_cases(
+            fresh_codes[0],
+            pass_inputs,
+            pass_outputs,
             **run_kw,
         )
 
-    pass_at_1 = False
-    if public_inputs and public_outputs:
-        fresh_codes = model.generate_solver_codes(
-            question, n=1, use_trainable_solver=True
-        )
-        model.ensure_solver_not_base(context="验证 pass@1")
-        if fresh_codes:
-            pass_at_1 = utils.solver_passes_all_cases(
-                fresh_codes[0],
-                public_inputs,
-                public_outputs,
-                **run_kw,
-            )
+    solver_gt_match = trainer.build_gt_match_matrix(
+        solver_codes,
+        gt_inputs,
+        gt_outputs,
+        exec_kwargs=run_kw,
+    )
+    if not solver_gt_match:
+        return {"skipped": True, "reason": "empty_gt_match", "mean_reward": 0.0}
+
+    rewards = trainer.calc_solver_gt_rewards(
+        solver_gt_match,
+        alpha=reward_alpha,
+    )
+    mean_r = sum(rewards) / len(rewards) if rewards else 0.0
 
     return {
         "skipped": False,
-        "num_inputs": len(inputs),
+        "num_inputs": len(gt_inputs),
         "solver_gen_backend": solver_gen,
         "rewards": rewards,
         "mean_reward": mean_r,
@@ -712,9 +773,8 @@ def eval_one(
     }
 
 
-def _load_public_test(model: Any, idx: int) -> tuple[List[str], List[str]]:
+def _load_public_test(ds: Any, idx: int) -> tuple[List[str], List[str]]:
     """加载题干样例（Public Test）input_output，与 rollout 测例分离。"""
-    ds = model.dataset
     getter_in = getattr(ds, "get_public_io_inputs", None) or getattr(
         ds, "get_io_inputs", None
     )
@@ -733,10 +793,31 @@ def _load_public_test(model: Any, idx: int) -> tuple[List[str], List[str]]:
     return inputs, outputs
 
 
+def _load_gt_tests(ds: Any, idx: int, count: int = 8) -> tuple[List[str], List[str]]:
+    """加载 hidden/GT 测例；count<=0 表示取全部。"""
+    getter_in = getattr(ds, "get_io_inputs", None)
+    getter_out = getattr(ds, "get_io_outputs", None)
+    if not callable(getter_in) or not callable(getter_out):
+        return [], []
+    try:
+        if int(count) <= 0:
+            inputs = list(getter_in(idx, max_count=0))
+            outputs = list(getter_out(idx, max_count=0))
+        else:
+            need = max(1, int(count))
+            inputs = list(getter_in(idx, max_count=need))
+            outputs = list(getter_out(idx, max_count=need))
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        return [], []
+    if len(inputs) != len(outputs) or not inputs:
+        return [], []
+    return inputs, outputs
+
+
 def run_validation(
     model: Any,
     trainer: MultiTrainer,
-    dataset: Any,
+    val_dataset: Any,
     val_indices: List[int],
     *,
     global_step: int,
@@ -748,31 +829,24 @@ def run_validation(
     if not val_indices:
         return {"skipped": True, "reason": "no_val_indices"}
 
+    val_name = (getattr(args, "val_dataset", "") or "same").strip().lower()
+    eval_full_tests = val_name in ("livecodebench", "lcb")
+    gt_count = int(getattr(args, "val_gt_count", 0) or 0)
+
     was_training = model.solver.model.training
     model.solver.model.eval()
-    naive_was_training = False
-    if model.naivesolver is not None:
-        naive_was_training = model.naivesolver.model.training
-        model.naivesolver.model.eval()
 
     val_solver_lora_dir = output_dir / "_val_lora_snapshot"
-    val_naive_lora_dir = output_dir / "_val_naive_lora_snapshot"
     use_vllm_lora = (
         getattr(model, "chat_backend", "") == "vllm"
         and getattr(model, "_use_lora", False)
     )
     if use_vllm_lora:
         model.sync_solver_lora_for_vllm(str(val_solver_lora_dir), lora_int_id=1)
-        model.sync_naive_lora_for_vllm(str(val_naive_lora_dir), lora_int_id=2)
-        logging.info(
-            "验证使用 vLLM+LoRA: solver=%s naive=%s",
-            val_solver_lora_dir,
-            val_naive_lora_dir,
-        )
+        logging.info("验证使用 vLLM+solver LoRA: %s", val_solver_lora_dir)
     else:
         model.clear_rollout_lora_snapshots()
 
-    input_count = args.val_input_count or args.input_count
     exec_kwargs = _exec_kwargs(args)
     per_problem: List[Dict[str, Any]] = []
     reward_sum = 0.0
@@ -793,22 +867,23 @@ def run_validation(
 
     try:
         for v_idx in iter_val:
-            question = dataset.get_by_tag("description", v_idx)
+            question = val_dataset.get_by_tag("description", v_idx)
             st = eval_one(
                 model,
                 trainer,
                 question,
                 idx=v_idx,
-                naive_bestofn=args.naive_bestofn,
+                dataset=val_dataset,
                 solver_bestofn=args.solver_bestofn,
-                input_count=input_count,
-                reward_beta=args.reward_beta,
+                reward_alpha=args.reward_alpha,
+                gt_count=gt_count,
+                eval_full_tests=eval_full_tests,
                 exec_kwargs=exec_kwargs,
             )
             per_problem.append(
                 {
                     "idx": v_idx,
-                    "id": str(dataset.get_by_tag("id", v_idx)),
+                    "id": str(val_dataset.get_by_tag("id", v_idx)),
                     "skipped": st.get("skipped", False),
                     "reason": st.get("reason", ""),
                     "mean_reward": round(float(st.get("mean_reward", 0.0)), 4),
@@ -841,8 +916,6 @@ def run_validation(
         model.clear_rollout_lora_snapshots()
         if was_training:
             model.solver.model.train()
-        if naive_was_training and model.naivesolver is not None:
-            model.naivesolver.model.train()
 
     mean_reward = reward_sum / ok_n if ok_n else 0.0
     pass_at_1_rate = pass_n / ok_n if ok_n else 0.0
@@ -850,6 +923,7 @@ def run_validation(
     summary = {
         "train_step": global_step,
         "update_step": update_step,
+        "val_dataset": val_name,
         "n_val": len(val_indices),
         "n_ok": ok_n,
         "n_skip": skip_n,
@@ -922,6 +996,7 @@ def load_or_build_val_indices(
     val_size: int,
     val_seed: int,
     val_indices_file: str,
+    val_dataset_name: str = "",
 ) -> List[int]:
     if val_size <= 0:
         return []
@@ -932,7 +1007,20 @@ def load_or_build_val_indices(
         indices = data.get("indices") if isinstance(data, dict) else data
         if not isinstance(indices, list):
             raise ValueError(f"无效的验证集文件: {path}")
-        return [int(i) for i in indices]
+        cur_name = (val_dataset_name or "same").strip().lower()
+        if isinstance(data, dict) and cur_name:
+            saved = str(data.get("val_dataset") or "same").strip().lower()
+            if saved == cur_name or (
+                saved == "same" and cur_name in ("same", "train", "none", "")
+            ):
+                return [int(i) for i in indices]
+            logging.warning(
+                "val_indices.json 的 val_dataset=%s 与当前 %s 不一致，重新抽样",
+                saved,
+                cur_name,
+            )
+        else:
+            return [int(i) for i in indices]
 
     pool = _indices_with_io(dataset)
     if len(pool) < val_size:
@@ -947,6 +1035,7 @@ def load_or_build_val_indices(
     out_path.write_text(
         json.dumps(
             {
+                "val_dataset": val_dataset_name or "same",
                 "dataset_size": len(dataset.df),
                 "pool_size": len(pool),
                 "val_size": val_size,
@@ -959,6 +1048,52 @@ def load_or_build_val_indices(
         encoding="utf-8",
     )
     return chosen
+
+
+def resolve_val_dataset_path(args: argparse.Namespace) -> str:
+    if args.val_dataset_path:
+        return args.val_dataset_path
+    name = (args.val_dataset or "").strip().lower()
+    if name in ("", "same", "train", "none"):
+        return ""
+    return default_val_dataset_path(name)
+
+
+def default_val_dataset_path(dataset: str) -> str:
+    from alldatasets.loader import default_dataset_path
+
+    return default_dataset_path(dataset)
+
+
+def load_val_dataset(args: argparse.Namespace) -> Optional[Any]:
+    """加载独立验证集；same/train/none 时返回 None（沿用训练集 hold-out）。"""
+    name = (args.val_dataset or "").strip().lower()
+    if not name or name in ("same", "train", "none"):
+        return None
+    if args.val_size <= 0:
+        return None
+
+    path = resolve_val_dataset_path(args)
+    extra: Dict[str, Any] = {}
+    if name in ("livecodebench", "lcb"):
+        extra["include_public"] = True
+        extra["include_private"] = True
+    if name in ("cure_codecontests", "cure_cc"):
+        extra["split"] = "test"
+        extra["rollout_io_source"] = args.dataset_rollout_io_source
+        extra["public_io_source"] = args.dataset_public_io_source
+    if name in ("codecontests", "cc"):
+        extra["rollout_io_source"] = args.dataset_rollout_io_source
+        extra["public_io_source"] = args.dataset_public_io_source
+
+    ds = load_dataset(name, path, **extra)
+    logging.info(
+        "验证集加载完成 [%s] path=%s 共 %d 题",
+        name,
+        path,
+        len(ds.df),
+    )
+    return ds
 
 
 def resolve_dataset_path(args: argparse.Namespace) -> str:
@@ -1003,18 +1138,26 @@ def train_loop(
 
     summary = logging.getLogger(TRAIN_SUMMARY_LOGGER)
 
+    val_dataset = load_val_dataset(args)
+    val_ds_for_indices = val_dataset if val_dataset is not None else dataset
+    val_name = (args.val_dataset or "same").strip().lower()
     val_indices = load_or_build_val_indices(
-        dataset,
+        val_ds_for_indices,
         output_dir,
         val_size=args.val_size,
         val_seed=args.val_seed,
         val_indices_file=args.val_indices_file,
+        val_dataset_name=val_name,
     )
-    val_set: Set[int] = set(val_indices)
-    train_indices = [i for i in range(args.start, end) if i not in val_set]
-    if val_set and args.debug:
+    if val_dataset is not None:
+        train_indices = list(range(args.start, end))
+    else:
+        val_set: Set[int] = set(val_indices)
+        train_indices = [i for i in range(args.start, end) if i not in val_set]
+    if val_indices and args.debug:
         summary.info(
-            "val_init n=%d train_n=%d val_indices=%s",
+            "val_init dataset=%s n=%d train_n=%d val_indices=%s",
+            val_name,
             len(val_indices),
             len(train_indices),
             str(output_dir / "val_indices.json"),
@@ -1024,7 +1167,7 @@ def train_loop(
         val_stats = run_validation(
             model,
             trainer,
-            dataset,
+            val_ds_for_indices,
             val_indices,
             global_step=0,
             update_step=0,
@@ -1058,6 +1201,9 @@ def train_loop(
                 min_reward=args.min_reward,
                 reward_beta=args.reward_beta,
                 reward_alpha=args.reward_alpha,
+                ppo_epochs=args.ppo_epochs,
+                ppo_clip_eps=args.ppo_clip_eps,
+                ppo_normalize_adv=args.ppo_normalize_adv,
                 exec_kwargs=_exec_kwargs(args),
                 rollout_cache_dir=args.rollout_cache_dir,
             )
@@ -1117,7 +1263,7 @@ def train_loop(
                 val_stats = run_validation(
                     model,
                     trainer,
-                    dataset,
+                    val_ds_for_indices,
                     val_indices,
                     global_step=global_step, 
                     update_step=update_step,
@@ -1142,7 +1288,7 @@ def train_loop(
         val_stats = run_validation(
             model,
             trainer,
-            dataset,
+            val_ds_for_indices,
             val_indices,
             global_step=global_step,
             update_step=update_step,

@@ -147,32 +147,61 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
 # python model/run_pass1_codecontests_gpu3456.py
 # 结果: outputs/pass1_eval_codecontests/*_summary.json
 
-# ---------- CURE_codecontests 训练（train split 4529 题，json 直读免解压）----------
-# 数据：~/datasets/CURE_codecontests/{train,test}/
-# rollout 测例=test_input（隐藏测例），Public Test=example_input（题干样例）
+# ---------- CURE_codecontests 训练（IGAR + PPO，LCB 验证，先跑 2000 题）----------
+# 数据：~/lzh/datasets/CURE_codecontests/{train,test}/
+# 验证：仅 solver pass@1 / BoN / GT 奖励（不生成 naive，只同步 solver LoRA）
+# rollout 测例=test_input（8 条 hidden GT），Public Test=example_input
+cd ~/lzh/apr
+
 CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py \
   --dataset cure_codecontests \
-  --dataset_path ~/datasets/CURE_codecontests \
+  --dataset_path ~/lzh/datasets/CURE_codecontests/train \
+  --dataset_rollout_io_source tests \
+  --dataset_public_io_source sample \
   --model_path ~/lzh/Qwen2.5-Coder-7B-Instruct \
   --chat_backend vllm \
   --vllm_tp_size 2 \
+  --vllm_gpu_memory_utilization 0.85 \
   --devices cuda:2,cuda:3 \
   --use_lora \
   --gradient_checkpointing \
-  --inject_mode half \
-  --inject_value 10 \
-  --exec_timeout 30 \
-  --exec_workers 8 \
-  --output_dir outputs/naive_solver_rl_cure_cc \
+  --lora_r 64 \
+  --lora_alpha 128 \
+  --lora_dropout 0.05 \
+  --lr 1e-5 \
+  --max_new_tokens 1024 \
+  --temperature 0.7 \
+  --input_source input_output \
+  --input_count 8 \
   --naive_bestofn 16 \
   --solver_bestofn 16 \
-  --input_count 10 \
-  --input_source input_output \
+  --reward_alpha 1.0 \
+  --reward_beta 0.3 \
+  --min_reward 0.0 \
+  --ppo_epochs 4 \
+  --ppo_clip_eps 0.2 \
+  --exec_timeout 30 \
+  --exec_workers 32 \
+  --inject_mode half \
+  --inject_value 10 \
+  --output_dir outputs/naive_solver_rl_cure_igar_ppo \
+  --rollout_cache_dir outputs/naive_solver_rl_cure_igar_ppo/rollout_cache \
+  --start 0 \
+  --end 2000 \
   --epochs 1 \
   --save_every 50 \
+  --val_dataset livecodebench \
+  --val_dataset_path ~/lzh/datasets/LiveCodeBench \
   --val_size 300 \
+  --val_gt_count 0 \
   --val_every 25 \
   --val_seed 42
+
+# 后台跑：
+# nohup bash -c 'CUDA_VISIBLE_DEVICES=4,5,6,7 python model/train.py ...' \
+#   > outputs/naive_solver_rl_cure_igar_ppo/train.out 2>&1 &
+
+# 旧版 CURE 训练（训练集内 hold-out 验证）见 git history
 
 # ---------- alldatasets 统一评测（物理卡 1）----------
 # 数据：~/lzh/datasets/{LiveCodeBench,codeforces}/test/
